@@ -2,7 +2,7 @@
 
 # Les Contemplations
 
-**An immersive, mood-driven virtual art gallery — built to help people feel better through art.**
+**An immersive, mood-driven virtual art gallery, built to help people feel better through art.**
 
 [![Live Demo](https://img.shields.io/badge/demo-Hugging%20Face%20Space-yellow)](https://huggingface.co/spaces/aichakorovaev/les-contemplations)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
