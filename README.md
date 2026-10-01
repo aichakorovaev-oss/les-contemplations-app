@@ -17,7 +17,7 @@ Les Contemplations is a walkable, first-person 3D art gallery that curates a per
 
 The goal isn't just to display paintings, it's to give people a few quiet, guided minutes with art that meets them where they are, and gently nudges them toward feeling a little better.
 
-**[→ Try the live demo](https://aichakorovaev-les-contemplations.hf.space)**
+**[→ Try the live demo](https://aichakorovaev-les-contemplations.hf.space/?__theme=system&__sign=eyJhbGciOiJFZERTQSIsImtpZCI6IjVHZDBvd0g5MTM2eDZjc1FvbE1zcktNWUZoRVFoUm5PVVVybEpjOUhaUEEifQ.eyJyZWFkIjp0cnVlLCJwZXJtaXNzaW9ucyI6eyJyZXBvLmNvbnRlbnQucmVhZCI6dHJ1ZX0sIm9uQmVoYWxmT2YiOnsia2luZCI6InVzZXIiLCJfaWQiOiI2YTA2N2FlNmFjZmNiZTc0Y2U4ODYxOTUiLCJ1c2VyIjoiYWljaGFrb3JvdmFldiIsInNlc3Npb25JZCI6IjZhYjZjZGUyNjcwMjI2NjRhOTY5ZmM5MyJ9LCJpYXQiOjE3OTA4MzQyOTcsImp0aSI6ImFlYTYwYmNlLWMxZDUtNDllMy1hYzBkLThmZThmOWRjMDcyOSIsInN1YiI6Ii9zcGFjZXMvYWljaGFrb3JvdmFldi9sZXMtY29udGVtcGxhdGlvbnMiLCJleHAiOjE3OTA5MjA2OTcsImlzcyI6Imh0dHBzOi8vaHVnZ2luZ2ZhY2UuY28ifQ.0b0bIj0fl8gYEaZ_z-bGM_WqbA38VXX7dnedHqC5Vq08XbboCyYSxk7ELj66difqZfos_z4IMQgV6xjxzN24AA)**
 
 ## Features
 
