@@ -1,0 +1,18 @@
+# Déploiement Render (Blueprint) : « New + > Blueprint » puis sélectionner le dépôt.
+services:
+  - type: web
+    name: les-contemplations
+    runtime: node
+    plan: free
+    region: frankfurt          # le plus proche de Paris
+    buildCommand: npm ci --include=dev && npm run build
+    startCommand: npm start
+    healthCheckPath: /
+    envVars:
+      - key: NODE_VERSION
+        value: 22
+      - key: GEMINI_API_KEY
+        sync: false            # à saisir dans le tableau de bord, jamais dans le dépôt
+      # Optionnel :
+      # - key: GEMINI_MODEL
+      #   value: gemini-3.1-flash-lite

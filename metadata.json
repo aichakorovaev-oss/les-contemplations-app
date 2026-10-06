@@ -1,0 +1,7 @@
+{
+  "name": "Les Contemplations : Galerie Virtuelle",
+  "description": "Galerie d'art virtuelle 3D immersive et personnalisée selon votre désir de contemplation, parcours sur mesure et contemplation guidée.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
+
