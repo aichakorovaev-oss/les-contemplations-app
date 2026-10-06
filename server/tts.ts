@@ -9,9 +9,11 @@
  * Le client n'a rien à changer : il envoie { text, voice } et reçoit un WAV.
  */
 import { createHash } from 'crypto';
+import { DEFAULT_TTS_MODELS, parseModels, withFallback } from './fallback.ts';
 
 const ENDPOINT = () => (process.env.GOOGLE_GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com') + '/v1beta/interactions';
-const MODEL = () => process.env.TTS_MODEL || 'gemini-3.8-flash-lite-tts';
+// Modèles vocaux par ordre de préférence (même schéma de requête) : TTS_MODELS="a,b" et/ou TTS_MODEL="a".
+const MODELS = () => parseModels(process.env.TTS_MODELS, process.env.TTS_MODEL, DEFAULT_TTS_MODELS);
 const STYLE = () => process.env.TTS_STYLE || 'calm, warm and unhurried, like a gentle museum guide';
 export const MAX_TTS_CHARS = 2500;
 
@@ -22,9 +24,9 @@ export function voiceFor(requested: unknown): string {
   return process.env.TTS_VOICE_FR || process.env.TTS_VOICE || 'Sulafat';
 }
 
-export function buildTtsRequest(text: string, voice: string) {
+export function buildTtsRequest(text: string, voice: string, model: string) {
   return {
-    model: MODEL(),
+    model,
     input: [
       {
         type: 'user_input',
@@ -90,7 +92,7 @@ function cacheSet(key: string, val: Buffer) {
 
 export async function synthesize(text: string, requestedVoice: unknown, apiKey: string): Promise<Buffer> {
   const voice = voiceFor(requestedVoice);
-  const key = createHash('sha1').update(`${MODEL()}|${voice}|${STYLE()}|${text}`).digest('hex');
+  const key = createHash('sha1').update(`${voice}|${STYLE()}|${text}`).digest('hex');
   const hit = cache.get(key);
   if (hit) {
     cache.delete(key);
@@ -98,24 +100,32 @@ export async function synthesize(text: string, requestedVoice: unknown, apiKey: 
     return hit;
   }
 
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), 45_000);
-  try {
-    const res = await fetch(ENDPOINT(), {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
-      body: JSON.stringify(buildTtsRequest(text, voice)),
-      signal: ctrl.signal,
-    });
-    if (!res.ok) {
-      throw new Error(`Gemini TTS ${res.status}: ${(await res.text()).slice(0, 200)}`);
-    }
-    const b64 = extractAudioBase64(await res.json());
-    if (!b64) throw new Error('Gemini TTS: aucune donnée audio dans la réponse');
-    const wav = ensureWav(Buffer.from(b64, 'base64'));
-    cacheSet(key, wav);
-    return wav;
-  } finally {
-    clearTimeout(timer);
-  }
+  const wav = await withFallback(
+    MODELS(),
+    async model => {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 40_000);
+      try {
+        const res = await fetch(ENDPOINT(), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
+          body: JSON.stringify(buildTtsRequest(text, voice, model)),
+          signal: ctrl.signal,
+        });
+        if (!res.ok) {
+          throw Object.assign(new Error(`Gemini TTS ${res.status}: ${(await res.text()).slice(0, 200)}`), {
+            status: res.status,
+          });
+        }
+        const b64 = extractAudioBase64(await res.json());
+        if (!b64) throw new Error('Gemini TTS: JSON invalide : aucune donnée audio dans la réponse');
+        return ensureWav(Buffer.from(b64, 'base64'));
+      } finally {
+        clearTimeout(timer);
+      }
+    },
+    { label: 'Gemini TTS', attemptTimeoutMs: 45_000, budgetMs: 70_000 }
+  );
+  cacheSet(key, wav);
+  return wav;
 }
