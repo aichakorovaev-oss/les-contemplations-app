@@ -9,6 +9,6 @@ services:
     envVars:
       - key: GEMINI_API_KEY
         sync: false            # à saisir dans le tableau de bord, jamais dans le dépôt
-      # Optionnel :
-      # - key: GEMINI_MODEL
-      #   value: gemini-3.1-flash-lite
+      Optionnel :
+       - key: GEMINI_MODEL
+         value: gemini-3.5-flash-lite
