@@ -16,6 +16,7 @@ import {
   normalizeAnnotationPoints,
 } from './src/shared/prompts.ts';
 import { synthesize, MAX_TTS_CHARS } from './server/tts.ts';
+import { DEFAULT_TEXT_MODELS, parseModels, withFallback } from './server/fallback.ts';
 
 dotenv.config();
 
@@ -59,9 +60,10 @@ function seededShuffle<T>(arr: T[], rnd: () => number): T[] {
   return a;
 }
 
-// Modèle texte/vision. L'original utilisait gemini-3.1-flash-lite ; le portage
-// gemini-3.8-flash. Surchargeable sans toucher au code : GEMINI_MODEL=...
-const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.8-flash';
+// Modèles texte/vision, par ordre de préférence. Si l'un répond 503 (forte demande), 429, etc.,
+// on passe au suivant. Surchargeable : GEMINI_MODELS="a,b,c" (liste) et/ou GEMINI_MODEL="a" (prioritaire).
+const TEXT_MODELS = parseModels(process.env.GEMINI_MODELS, process.env.GEMINI_MODEL, DEFAULT_TEXT_MODELS);
+console.log('Modèles Gemini (ordre de repli) :', TEXT_MODELS.join(' → '));
 
 // Limiteur de débit minimal (par IP, fenêtre d'une minute) pour protéger la clé API.
 function rateLimit(max: number) {
@@ -80,13 +82,24 @@ app.set('trust proxy', 1);
 
 const asLang = (v: unknown): 'fr' | 'en' => (v === 'en' ? 'en' : 'fr');
 
-async function askGemini(contents: any, temperature: number): Promise<any> {
-  const response = await ai!.models.generateContent({
-    model: GEMINI_MODEL,
-    contents,
-    config: { responseMimeType: 'application/json', temperature, maxOutputTokens: 8192 },
+/**
+ * Appelle Gemini en JSON avec repli automatique entre modèles.
+ * `validate` (facultatif) rejette une sortie inexploitable : le modèle suivant est alors essayé.
+ */
+async function askGemini(contents: any, temperature: number, validate?: (json: any) => void): Promise<any> {
+  return withFallback(TEXT_MODELS, async model => {
+    const response = await ai!.models.generateContent({
+      model,
+      contents,
+      config: { responseMimeType: 'application/json', temperature, maxOutputTokens: 8192 },
+    });
+    const json = parseModelJSON(response.text);
+    if (!json || typeof json !== 'object' || Object.keys(json).length === 0) {
+      throw new Error('JSON invalide : réponse vide');
+    }
+    if (validate) validate(json);
+    return json;
   });
-  return parseModelJSON(response.text);
 }
 
 // ─── POST /api/curate — sélection (appel 1) puis textes personnalisés (appel 2) ───
@@ -113,7 +126,10 @@ app.post('/api/curate', rateLimit(12), async (req, res) => {
     const shuffled = seededShuffle(catalogue, mulberry32(daySeed));
 
     // Appel 1 — choix des œuvres + raison
-    const j1 = await askGemini(buildSelectionPrompt({ lang, mood, catalogue: shuffled, daySeed }), 0.95);
+    const j1 = await askGemini(buildSelectionPrompt({ lang, mood, catalogue: shuffled, daySeed }), 0.95, json => {
+      const known = (json.selected || []).filter((it: any) => catalogue.some(c => c.id === (typeof it === 'string' ? it : it?.id)));
+      if (known.length < 2) throw new Error('JSON invalide : sélection inexploitable');
+    });
     const reasonMap: Record<string, string> = {};
     const ids: string[] = (j1.selected || []).slice(0, 10).map((item: any) => {
       if (typeof item === 'string') return item;
@@ -182,7 +198,9 @@ app.post('/api/annotate', rateLimit(30), async (req, res) => {
     parts.push({ text: prompt });
 
     // Température basse → coordonnées plus précises.
-    const json = await askGemini([{ role: 'user', parts }], 0.2);
+    const json = await askGemini([{ role: 'user', parts }], 0.2, j => {
+      if (!normalizeAnnotationPoints(j).length) throw new Error('JSON invalide : aucun point exploitable');
+    });
     const points = normalizeAnnotationPoints(json);
     if (!points.length) return res.status(502).json({ error: 'No usable points returned' });
     res.json({ points });
