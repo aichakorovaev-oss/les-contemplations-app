@@ -2,15 +2,11 @@
 services:
   - type: web
     name: les-contemplations
-    runtime: node
+    runtime: docker            # utilise le Dockerfile (Node 22) à la racine
     plan: free
     region: frankfurt          # le plus proche de Paris
-    buildCommand: npm ci --include=dev && npm run build
-    startCommand: npm start
     healthCheckPath: /
     envVars:
-      - key: NODE_VERSION
-        value: 22
       - key: GEMINI_API_KEY
         sync: false            # à saisir dans le tableau de bord, jamais dans le dépôt
       # Optionnel :
