@@ -7,7 +7,7 @@ import { buildGallery, populatePaintings, GalleryBuildResult } from './three/bui
 import { FirstPersonRig } from './three/controls';
 import { galleryAudio } from './services/audio';
 import { fetchImageUrl } from './services/imageResolver';
-import { buildMoodParcours, fetchAnnotations } from './services/gemini';
+import { buildMoodParcours, fetchAnnotations, fetchTexts } from './services/gemini';
 import {
   speakEdgeTTS,
   stopNarration,
@@ -201,9 +201,18 @@ export default function App() {
   const focusOnRef = useRef<((index: number, isInitial: boolean, refit?: boolean) => void) | null>(null);
   const nudityConsentRef = useRef<boolean | null>(null);
   nudityConsentRef.current = nudityConsent;
+  const langRef = useRef<Lang>(lang);
+  langRef.current = lang;
+  const moodTagsRef = useRef<string[]>([]);
+  moodTagsRef.current = currentMoodTags;
+  const moodTextRef = useRef('');
+  moodTextRef.current = userMoodText;
+  const langSwitchTokenRef = useRef(0);
 
-  // Change Language & seamlessly translate active paintings
+  // Changement de langue : on retraduit le catalogue ET les textes générés par l'IA
+  // (méditation, raison, anecdote, questions, annotations, accueil), sinon on mélange les langues.
   const handleSelectLang = useCallback((newLang: Lang) => {
+    if (newLang === langRef.current) return;
     setLang(newLang);
     try {
       localStorage.setItem('ml-lang', newLang);
@@ -211,8 +220,16 @@ export default function App() {
     document.title = t('title_doc', newLang);
     document.documentElement.lang = newLang;
 
-    // Immediately update titles, mediums, locations, descriptions of active paintings
+    // Visite guidée / narration en cours dans l'ancienne langue : on les arrête
+    setIsGuiding(false);
+    haltSpeech();
+    stopNarration(setIsNarrating);
+
     const localized = getLocalizedCatalogue(newLang);
+    const hadAI = paintingsRef.current.some(
+      p => p.meditation || p.raison || p.anecdote || (p.questions && p.questions.length > 0)
+    );
+
     setPaintings(prev =>
       prev.map(p => {
         const found = localized.find(c => c.id === p.id);
@@ -225,10 +242,36 @@ export default function App() {
           dimensions: found.dimensions,
           location: found.location,
           desc: found.desc,
+          // Textes générés dans l'ancienne langue : retirés, puis régénérés ci-dessous
+          ...(hadAI ? { meditation: '', raison: '', anecdote: '', questions: [] } : {}),
+          annotations: undefined,
         };
       })
     );
+    setParcoursResult(prev => (prev ? { ...prev, introText: t('fallback_intro', newLang) } : prev));
+
+    if (hadAI) {
+      const token = ++langSwitchTokenRef.current;
+      fetchTexts(
+        paintingsRef.current.map(p => p.id),
+        moodTagsRef.current,
+        moodTextRef.current,
+        newLang
+      ).then(texts => {
+        // abandonné si le visiteur a rechangé de langue entre-temps
+        if (!texts || token !== langSwitchTokenRef.current || langRef.current !== newLang) return;
+        setPaintings(prev =>
+          prev.map(p => {
+            const x = texts[p.id];
+            return x
+              ? { ...p, meditation: x.meditation || p.desc, raison: x.raison, anecdote: x.anecdote, questions: x.questions }
+              : p;
+          })
+        );
+      });
+    }
   }, []);
+
 
   // Update light dimming
   const applyDimming = useCallback((tval: number) => {
@@ -303,7 +346,13 @@ export default function App() {
 
     // Œuvre sensible : pas de narration tant que le visiteur n'a pas consenti (comme l'original).
     const gated = !!(newP.nudity || newP.graphic) && nudityConsentRef.current !== true;
-    if (!gated && !refit) prefetchNarration(newP, lang); // réchauffe l'audio pendant que la caméra glisse
+    if (!gated && !refit && tweaks.narration) {
+      prefetchNarration(newP, lang); // réchauffe l'audio pendant que la caméra glisse
+      // Le tableau suivant : seulement le 1er morceau (titre + artiste) pour qu'il démarre instantanément
+      const list = paintingsRef.current;
+      const nextP = list.length > 1 ? list[(index + 1) % list.length] : null;
+      if (nextP && !nextP.nudity && !nextP.graphic) prefetchNarration(nextP, lang, true);
+    }
     if (tweaks.narration && !gated && !refit) {
       stopNarration(setIsNarrating);
       speakEdgeTTS(buildNarrationText(newP, lang), newP, lang, setIsNarrating);
@@ -852,7 +901,7 @@ export default function App() {
     setIsGuideLoading(true);
 
     try {
-      const anns = await fetchAnnotations(currentP, userMoodText, lang);
+      const anns = await fetchAnnotations(currentP, currentMoodTags, userMoodText, lang);
       currentP.annotations = anns;
       setIsGuiding(true);
     } finally {

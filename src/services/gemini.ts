@@ -64,9 +64,39 @@ export async function buildMoodParcours(
   };
 }
 
+export interface RegeneratedTexts {
+  meditation: string;
+  raison: string;
+  anecdote: string;
+  questions: string[];
+}
+
+/** Régénère les textes IA (méditation, raison, anecdote, questions) dans une autre langue. */
+export async function fetchTexts(
+  ids: string[],
+  tags: string[],
+  freeText: string,
+  lang: Lang
+): Promise<Record<string, RegeneratedTexts> | null> {
+  try {
+    const res = await fetch('/api/texts', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ids, tags, freeText, lang }),
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    return Object.fromEntries((data.texts || []).map((x: any) => [x.id, x]));
+  } catch (err) {
+    console.warn('Régénération des textes impossible :', err);
+    return null;
+  }
+}
+
 export async function fetchAnnotations(
   p: Painting,
-  userMood: string,
+  moodTags: string[],
+  moodText: string,
   lang: Lang
 ): Promise<AnnotationPoint[]> {
   if (Array.isArray(p.annotations) && p.annotations.length > 0) return p.annotations;
@@ -91,7 +121,8 @@ export async function fetchAnnotations(
           raison: p.raison,
           meditation: p.meditation,
         },
-        userMood,
+        moodTags,
+        moodText,
         lang,
         image: imageInline,
       }),

@@ -2,7 +2,7 @@ import React, { useEffect, useRef, useState, useCallback } from 'react';
 import * as THREE from 'three';
 import { Lang, Painting, AnnotationPoint } from '../types/gallery';
 import { t } from '../i18n/strings';
-import { ttsPlay, haltSpeech } from '../services/tts';
+import { ttsPlay, haltSpeech, prefetchText } from '../services/tts';
 
 interface GuidedAnnotationsProps {
   lang: Lang;
@@ -68,6 +68,7 @@ export const GuidedAnnotations: React.FC<GuidedAnnotationsProps> = ({
 
   const calloutEls = useRef<(HTMLDivElement | null)[]>([]);
   const heightsRef = useRef<number[]>([]);
+  const frameRef = useRef(0);
   const heightsKeyRef = useRef('');
   const lastLayoutKey = useRef('');
 
@@ -93,9 +94,13 @@ export const GuidedAnnotations: React.FC<GuidedAnnotationsProps> = ({
       heightsKeyRef.current = hKey;
       heightsRef.current = [];
     }
-    calloutEls.current.forEach((el, i) => {
-      if (el && el.offsetHeight) heightsRef.current[i] = el.offsetHeight;
-    });
+    // Lecture du DOM (reflow forcé) : toutes les ~12 images seulement, ou tant qu'on n'a aucune mesure.
+    frameRef.current++;
+    if (frameRef.current % 12 === 0 || heightsRef.current.length === 0) {
+      calloutEls.current.forEach((el, i) => {
+        if (el && el.offsetHeight) heightsRef.current[i] = el.offsetHeight;
+      });
+    }
 
     let bbL = 0;
     let bbR = W;
@@ -124,9 +129,14 @@ export const GuidedAnnotations: React.FC<GuidedAnnotationsProps> = ({
     const roomL = bbL - 12;
     const roomR = W - bbR - 12;
     const sideRoom = Math.min(roomL, roomR);
-    let mode: 'side' | 'sheet' = W >= 560 && sideRoom >= MIN_SIDE_ROOM ? 'side' : 'sheet';
+    // Image agrandie sur un écran large : les bulles restent de part et d'autre, reliées par une ligne,
+    // même quand l'image est zoomée au-delà des bords (elles se collent alors aux bords de l'écran).
+    const wideDetail = detailMode && W >= 900 && H >= 520;
+    let mode: 'side' | 'sheet' = wideDetail || (W >= 560 && sideRoom >= MIN_SIDE_ROOM) ? 'side' : 'sheet';
     const maxW = shortScreen ? 208 : MAX_CALLOUT_W;
-    const calloutW = Math.min(maxW, Math.max(MIN_SIDE_ROOM - GAPX, Math.floor(sideRoom - GAPX)));
+    const calloutW = wideDetail
+      ? 232
+      : Math.min(maxW, Math.max(MIN_SIDE_ROOM - GAPX, Math.floor(sideRoom - GAPX)));
 
     const items = annotations.map((ann, idx) => {
       const s = dotPos(ann.x, ann.y);
@@ -270,6 +280,9 @@ export const GuidedAnnotations: React.FC<GuidedAnnotationsProps> = ({
       setActiveStep(-1);
       setShownStep(-1);
 
+      // Les 2 premières annotations sont synthétisées pendant que l'introduction est lue
+      prefetchText(introText, lang);
+      annotations.slice(0, 2).forEach(a => prefetchText(a.text, lang));
       await ttsPlay(introText, lang);
       if (token !== guideTokenRef.current) return;
       await new Promise(r => setTimeout(r, 450));
@@ -278,6 +291,7 @@ export const GuidedAnnotations: React.FC<GuidedAnnotationsProps> = ({
         if (token !== guideTokenRef.current) return;
         setActiveStep(i);
         setShownStep(i);
+        if (annotations[i + 2]) prefetchText(annotations[i + 2].text, lang);
         await new Promise(r => setTimeout(r, i === 0 ? 250 : 650));
         if (token !== guideTokenRef.current) return;
         await ttsPlay(annotations[i].text, lang);

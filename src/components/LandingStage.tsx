@@ -91,7 +91,9 @@ export const LandingStage: React.FC<LandingStageProps> = ({ lang, onSubmitMood, 
       }
       if (cargoRef.current) {
         cargoRef.current.style.transformOrigin = '50% -80px';
-        cargoRef.current.style.transform = `rotate(${swing.toFixed(3)}deg)`;
+        // Sur téléphone, un grand panneau qui pivote de ±1° se décale de ±12 px en bas : on amortit
+        const amp = window.innerWidth < 640 ? 0.3 : 1;
+        cargoRef.current.style.transform = `rotate(${(swing * amp).toFixed(3)}deg)`;
       }
 
       rafId = requestAnimationFrame(frame);

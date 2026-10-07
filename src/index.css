@@ -1136,6 +1136,13 @@ body.annot-sheet-open #focus-caption, body.annot-sheet-open #focus-nav { opacity
   .controls-hint { grid-template-columns: 1fr; gap: 8px; margin-top: 28px; }
   #room-nudge { top: calc(100px + var(--sat)); font-size: 12px; padding: 11px 18px; }
 
+  /* Écran d'humeur : le groupe cerf-volant + carte est centré dans la hauteur (au lieu d'un
+     padding-top de 32vh pensé pour l'ordinateur, qui poussait la carte hors de l'écran) */
+  #landing-screen.is-mood .kite-column {
+    height: auto; min-height: 100%; justify-content: center; transform: none;
+    padding: calc(190px + var(--sat)) 0 calc(28px + var(--sab));
+  }
+  #landing-screen.is-mood .mood-cargo { width: 100%; }
   /* Écran d'humeur : plus compact pour que les puces et « Continuer » restent accessibles */
   .mood-card { padding: 2rem 1.1rem 1.4rem; }
   .mood-card-bg { border-radius: 2rem; }
@@ -1196,3 +1203,8 @@ body.annot-sheet-open #focus-caption, body.annot-sheet-open #focus-nav { opacity
   #detail-close, #detail-guide-btn { top: calc(10px + var(--sat)); }
   #room-name, .room-plate { top: calc(48px + var(--sat)); }
 }
+
+/* ── Bouton « Guider mon regard » : l'œil tourne pendant le chargement des annotations (comme l'original) ── */
+@keyframes eyeSpin { to { transform: rotate(360deg); } }
+.focus-tool.loading { opacity: .65; cursor: progress; }
+.focus-tool.loading svg { animation: eyeSpin 1s linear infinite; transform-origin: 50% 50%; }

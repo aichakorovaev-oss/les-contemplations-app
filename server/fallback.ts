@@ -9,10 +9,12 @@
  * un autre modèle échouerait de la même façon.
  */
 
+// Les modèles « lite » d'abord : c'est celui de la version d'origine (gemini-3.1-flash-lite), nettement
+// plus rapide que gemini-3.8-flash, gardé en dernier recours pour la qualité.
 export const DEFAULT_TEXT_MODELS = [
-  'gemini-3.8-flash',
-  'gemini-3.5-flash-lite',
   'gemini-3.1-flash-lite',
+  'gemini-3.5-flash-lite',
+  'gemini-3.8-flash',
   'gemini-2.5-flash-lite',
 ];
 
@@ -54,6 +56,8 @@ export function classify(err: any): Verdict {
   if (status === 429 || /RESOURCE_EXHAUSTED/i.test(text)) return { retry: true, cooldownMs: 60_000 };
   if (status && RETRY_STATUS.has(status)) return { retry: true, cooldownMs: 45_000 };
   if (status && status >= 400 && status < 500) return { retry: false, cooldownMs: 0 }; // 400 / 401 / 403…
+  // Un modèle qui répond dans la mauvaise langue recommencera probablement : courte pause
+  if (/langue incorrecte/i.test(text)) return { retry: true, cooldownMs: 120_000 };
   if (/JSON invalide|Unexpected token/i.test(text)) return { retry: true, cooldownMs: 0 }; // mauvaise sortie, pas une panne
   if (RETRY_TEXT.test(text)) return { retry: true, cooldownMs: 45_000 };
   return { retry: false, cooldownMs: 0 };

@@ -1,6 +1,7 @@
 import express from 'express';
 import dotenv from 'dotenv';
 import path from 'path';
+import fs from 'fs';
 import { fileURLToPath } from 'url';
 import { GoogleGenAI } from '@google/genai';
 import { getLocalizedCatalogue } from './src/data/catalogue.ts';
@@ -17,6 +18,7 @@ import {
 } from './src/shared/prompts.ts';
 import { synthesize, MAX_TTS_CHARS } from './server/tts.ts';
 import { DEFAULT_TEXT_MODELS, parseModels, withFallback } from './server/fallback.ts';
+import { languageMismatch, languageSystemInstruction } from './src/shared/lang.ts';
 
 dotenv.config();
 
@@ -84,14 +86,26 @@ const asLang = (v: unknown): 'fr' | 'en' => (v === 'en' ? 'en' : 'fr');
 
 /**
  * Appelle Gemini en JSON avec repli automatique entre modèles.
- * `validate` (facultatif) rejette une sortie inexploitable : le modèle suivant est alors essayé.
+ * - la langue attendue est imposée en consigne système (le prompt d'origine est surtout en français) ;
+ * - `validate` (facultatif) rejette une sortie inexploitable ou dans la mauvaise langue :
+ *   le modèle suivant est alors essayé.
  */
-async function askGemini(contents: any, temperature: number, validate?: (json: any) => void): Promise<any> {
+async function askGemini(
+  contents: any,
+  temperature: number,
+  lang: 'fr' | 'en',
+  validate?: (json: any) => void
+): Promise<any> {
   return withFallback(TEXT_MODELS, async model => {
     const response = await ai!.models.generateContent({
       model,
       contents,
-      config: { responseMimeType: 'application/json', temperature, maxOutputTokens: 8192 },
+      config: {
+        responseMimeType: 'application/json',
+        temperature,
+        maxOutputTokens: 8192,
+        systemInstruction: languageSystemInstruction(lang),
+      },
     });
     const json = parseModelJSON(response.text);
     if (!json || typeof json !== 'object' || Object.keys(json).length === 0) {
@@ -101,6 +115,12 @@ async function askGemini(contents: any, temperature: number, validate?: (json: a
     return json;
   });
 }
+
+const assertLang = (lang: 'fr' | 'en', ...texts: (string | undefined)[]) => {
+  if (languageMismatch(texts.filter(Boolean).join(' '), lang)) {
+    throw new Error('JSON invalide : langue incorrecte');
+  }
+};
 
 // ─── POST /api/curate — sélection (appel 1) puis textes personnalisés (appel 2) ───
 app.post('/api/curate', rateLimit(12), async (req, res) => {
@@ -126,9 +146,10 @@ app.post('/api/curate', rateLimit(12), async (req, res) => {
     const shuffled = seededShuffle(catalogue, mulberry32(daySeed));
 
     // Appel 1 — choix des œuvres + raison
-    const j1 = await askGemini(buildSelectionPrompt({ lang, mood, catalogue: shuffled, daySeed }), 0.95, json => {
+    const j1 = await askGemini(buildSelectionPrompt({ lang, mood, catalogue: shuffled, daySeed }), 0.95, lang, json => {
       const known = (json.selected || []).filter((it: any) => catalogue.some(c => c.id === (typeof it === 'string' ? it : it?.id)));
       if (known.length < 2) throw new Error('JSON invalide : sélection inexploitable');
+      assertLang(lang, json.intro, ...(json.selected || []).map((it: any) => it?.reason));
     });
     const reasonMap: Record<string, string> = {};
     const ids: string[] = (j1.selected || []).slice(0, 10).map((item: any) => {
@@ -146,7 +167,9 @@ app.post('/api/curate', rateLimit(12), async (req, res) => {
     try {
       const j2 = await askGemini(
         buildTextsPrompt({ lang, mood, picks: picked.map(p => ({ p, reason: reasonMap[p.id] })) }),
-        0.85
+        0.85,
+        lang,
+        validateTexts(lang)
       );
       for (const item of j2.texts || []) tm[item.id] = item;
     } catch (e: any) {
@@ -169,6 +192,43 @@ app.post('/api/curate', rateLimit(12), async (req, res) => {
   }
 });
 
+const validateTexts = (lang: 'fr' | 'en') => (json: any) => {
+  const texts = Array.isArray(json.texts) ? json.texts : [];
+  if (!texts.length) throw new Error('JSON invalide : aucun texte');
+  assertLang(lang, ...texts.map((x: any) => x?.meditation), ...texts.map((x: any) => x?.raison), ...texts.map((x: any) => x?.anecdote));
+};
+
+// ─── POST /api/texts — régénère méditation / raison / anecdote / questions dans une autre langue ───
+// Utilisé quand le visiteur change de langue en cours de visite (sans recomposer le parcours).
+app.post('/api/texts', rateLimit(12), async (req, res) => {
+  try {
+    if (!ai) return res.status(500).json({ error: 'GEMINI_API_KEY not configured' });
+    const lang = asLang(req.body?.lang);
+    const catalogue = getLocalizedCatalogue(lang);
+    const ids: string[] = (Array.isArray(req.body?.ids) ? req.body.ids : []).map((x: unknown) => String(x)).slice(0, 12);
+    const picks = ids.map(id => catalogue.find(c => c.id === id)).filter(Boolean).map(p => ({ p: p! }));
+    if (!picks.length) return res.status(400).json({ error: 'ids required' });
+    const tags: string[] = (Array.isArray(req.body?.tags) ? req.body.tags : [])
+      .map((x: unknown) => clampText(x, 40))
+      .filter(Boolean)
+      .slice(0, 12);
+    const mood = moodString(tags, clampText(req.body?.freeText, 600), lang);
+    const json = await askGemini(buildTextsPrompt({ lang, mood, picks }), 0.85, lang, validateTexts(lang));
+    res.json({
+      texts: json.texts.map((x: any) => ({
+        id: String(x?.id || ''),
+        meditation: x?.meditation || '',
+        raison: x?.raison || '',
+        anecdote: x?.anecdote || '',
+        questions: Array.isArray(x?.questions) ? x.questions : [],
+      })),
+    });
+  } catch (err: any) {
+    console.error('Texts error:', err.message || err);
+    res.status(502).json({ error: 'texts unavailable' });
+  }
+});
+
 // ─── POST /api/annotate — points d'attention ancrés dans l'image (vision) ───
 app.post('/api/annotate', rateLimit(30), async (req, res) => {
   try {
@@ -176,6 +236,11 @@ app.post('/api/annotate', rateLimit(30), async (req, res) => {
     const { painting, image } = req.body || {};
     if (!painting || typeof painting.title !== 'string') return res.status(400).json({ error: 'painting required' });
     const lang = asLang(req.body?.lang);
+    const moodTags: string[] = (Array.isArray(req.body?.moodTags) ? req.body.moodTags : [])
+      .map((x: unknown) => clampText(x, 40))
+      .filter(Boolean)
+      .slice(0, 12);
+    const moodText = clampText(req.body?.moodText, 600);
 
     const prompt = buildAnnotatePrompt({
       lang,
@@ -187,7 +252,10 @@ app.post('/api/annotate', rateLimit(30), async (req, res) => {
         raison: clampText(painting.raison, 600),
         meditation: clampText(painting.meditation, 1200),
       },
-      userMood: clampText(req.body?.userMood, 800),
+      // Étiquettes + texte libre reconstruits dans la langue courante (l'ancien champ userMood reste accepté)
+      userMood: moodTags.length || moodText
+        ? moodString(moodTags, moodText, lang)
+        : clampText(req.body?.userMood, 800),
     });
 
     // L'image passe en PREMIER pour que le modèle s'ancre dans la toile réelle.
@@ -198,8 +266,10 @@ app.post('/api/annotate', rateLimit(30), async (req, res) => {
     parts.push({ text: prompt });
 
     // Température basse → coordonnées plus précises.
-    const json = await askGemini([{ role: 'user', parts }], 0.2, j => {
-      if (!normalizeAnnotationPoints(j).length) throw new Error('JSON invalide : aucun point exploitable');
+    const json = await askGemini([{ role: 'user', parts }], 0.2, lang, j => {
+      const pts = normalizeAnnotationPoints(j);
+      if (!pts.length) throw new Error('JSON invalide : aucun point exploitable');
+      assertLang(lang, ...pts.map(p => p.text), ...pts.map(p => p.label));
     });
     const points = normalizeAnnotationPoints(json);
     if (!points.length) return res.status(502).json({ error: 'No usable points returned' });
@@ -249,8 +319,34 @@ async function startServer() {
     app.use(vite.middlewares);
   } else {
     const distPath = path.resolve(__dirname, 'dist');
-    app.use(express.static(distPath));
+
+    // Fichiers déjà compressés au build (brotli / gzip) : on les sert tels quels, sans CPU.
+    app.use((req, res, next) => {
+      if (req.method !== 'GET' && req.method !== 'HEAD') return next();
+      const ext = path.extname(req.path);
+      if (!['.js', '.css', '.html', '.svg', '.json', '.txt'].includes(ext)) return next();
+      const enc = req.acceptsEncodings('br', 'gzip');
+      if (!enc) return next();
+      const file = path.join(distPath, path.normalize(req.path));
+      const compressed = file + (enc === 'br' ? '.br' : '.gz');
+      if (!file.startsWith(distPath) || !fs.existsSync(compressed)) return next();
+      res.set({ 'Content-Encoding': enc, Vary: 'Accept-Encoding' });
+      res.type(ext);
+      if (req.path.startsWith('/assets/')) res.set('Cache-Control', 'public, max-age=31536000, immutable');
+      res.sendFile(compressed, err => err && next());
+    });
+
+    // Les fichiers de /assets/ ont un nom empreinté (hash) : cache d'un an. L'index se revalide toujours.
+    app.use(
+      express.static(distPath, {
+        setHeaders: (res, filePath) => {
+          if (filePath.includes(`${path.sep}assets${path.sep}`)) res.set('Cache-Control', 'public, max-age=31536000, immutable');
+          else res.set('Cache-Control', 'no-cache');
+        },
+      })
+    );
     app.get('*', (_req, res) => {
+      res.set('Cache-Control', 'no-cache');
       res.sendFile(path.resolve(distPath, 'index.html'));
     });
   }

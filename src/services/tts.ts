@@ -1,10 +1,67 @@
 import { Lang, Painting } from '../types/gallery';
 import { t } from '../i18n/strings';
 
+/**
+ * Narration vocale.
+ *
+ * Latence : le serveur TTS synthétise un texte ENTIER avant de renvoyer le moindre octet. Une
+ * narration complète (≈ 700 caractères) mettait donc plusieurs secondes à démarrer. On la découpe
+ * en morceaux de taille croissante (titre + artiste, puis 1-2 phrases, puis le reste), tous demandés
+ * en parallèle et joués à la suite : la voix démarre dès que le PREMIER morceau (très court) est prêt.
+ */
+
 let isNarrating = false;
 let narrationToken = 0;
-const ttsCache = new Map<string, Promise<Blob>>();
 let _speechResolve: (() => void) | null = null;
+
+// ─────────────────────────────────────────────────────────────
+// Cache des morceaux audio (texte + voix → Blob)
+// ─────────────────────────────────────────────────────────────
+const audioCache = new Map<string, Promise<Blob>>();
+const MAX_CACHED = 48;
+
+function fetchAudio(text: string, voice: string): Promise<Blob> {
+  const key = `${voice}|${text}`;
+  const hit = audioCache.get(key);
+  if (hit) return hit;
+  const p = fetch('/tts', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text, voice }),
+  })
+    .then(res => {
+      if (!res.ok) throw new Error('/tts ' + res.status);
+      return res.blob();
+    })
+    .catch(e => {
+      audioCache.delete(key); // un échec ne doit pas rester en cache
+      throw e;
+    });
+  p.catch(() => {}); // évite « unhandled rejection » pour un préchargement que personne n'attend
+  audioCache.set(key, p);
+  while (audioCache.size > MAX_CACHED) audioCache.delete(audioCache.keys().next().value as string);
+  return p;
+}
+
+/** Découpe un texte en morceaux dont la taille augmente : le 1er est court pour démarrer vite. */
+export function splitNarration(text: string, limits: number[] = [110, 170, 260, 320]): string[] {
+  const clean = text.replace(/\s+/g, ' ').trim();
+  if (!clean) return [];
+  const sentences = (clean.match(/[^.!?…]+(?:[.!?…]+["»”)]*|$)/g) || [clean]).map(s => s.trim()).filter(Boolean);
+  const chunks: string[] = [];
+  let cur = '';
+  for (const s of sentences) {
+    const limit = limits[Math.min(chunks.length, limits.length - 1)];
+    if (cur && cur.length + 1 + s.length > limit) {
+      chunks.push(cur);
+      cur = s;
+    } else {
+      cur = cur ? `${cur} ${s}` : s;
+    }
+  }
+  if (cur) chunks.push(cur);
+  return chunks;
+}
 
 // ─────────────────────────────────────────────────────────────
 // Lecteur audio unique et « déverrouillé »
@@ -16,6 +73,8 @@ let _speechResolve: (() => void) | null = null;
 const SILENT_WAV = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YQAAAAA=';
 const NARRATION_VOLUME = 0.92;
 let sharedAudio: HTMLAudioElement | null = null;
+let _playResolve: ((r: 'ended' | 'error' | 'aborted') => void) | null = null;
+let _objectUrl: string | null = null;
 
 function player(): HTMLAudioElement {
   if (!sharedAudio) {
@@ -29,16 +88,53 @@ function player(): HTMLAudioElement {
 /** Arrête le lecteur SANS déclencher d'événement « error » tardif (qui annulerait la narration suivante). */
 function releasePlayer(): void {
   const a = sharedAudio;
-  if (!a) return;
-  a.onended = null;
-  a.onerror = null;
-  try {
-    a.pause();
-  } catch (_) {}
-  a.removeAttribute('src');
-  try {
-    a.load();
-  } catch (_) {}
+  if (a) {
+    a.onended = null;
+    a.onerror = null;
+    try {
+      a.pause();
+    } catch (_) {}
+    a.removeAttribute('src');
+    try {
+      a.load();
+    } catch (_) {}
+  }
+  if (_objectUrl) {
+    URL.revokeObjectURL(_objectUrl);
+    _objectUrl = null;
+  }
+  const r = _playResolve;
+  _playResolve = null;
+  if (r) r('aborted');
+}
+
+/** Joue un morceau et se résout à la fin ('ended'), en cas d'erreur ('error') ou d'arrêt ('aborted'). */
+function playBlob(blob: Blob): Promise<'ended' | 'error' | 'aborted'> {
+  return new Promise(resolve => {
+    releasePlayer();
+    const a = player();
+    const url = URL.createObjectURL(blob);
+    _objectUrl = url;
+    _playResolve = resolve;
+    a.volume = NARRATION_VOLUME;
+    a.src = url;
+    a.onended = () => {
+      if (_playResolve === resolve) _playResolve = null;
+      if (_objectUrl === url) {
+        URL.revokeObjectURL(url);
+        _objectUrl = null;
+      }
+      resolve('ended');
+    };
+    a.onerror = () => {
+      if (_playResolve === resolve) _playResolve = null;
+      resolve('error');
+    };
+    a.play().catch(() => {
+      if (_playResolve === resolve) _playResolve = null;
+      resolve('error');
+    });
+  });
 }
 
 let unlocked = false;
@@ -69,10 +165,6 @@ export function unlockAudio(): void {
   } catch (_) {}
 }
 
-export function ttsCacheKey(p: Painting, lang: Lang, voice: string): string {
-  return `${p.id}|${lang}|${voice}`;
-}
-
 export function buildNarrationText(p: Painting, lang: Lang): string {
   const parts = [`${p.title}. ${p.artist}, ${p.year}.`];
   if (p.meditation) parts.push(p.meditation);
@@ -81,27 +173,23 @@ export function buildNarrationText(p: Painting, lang: Lang): string {
   return parts.join('  ');
 }
 
-/** Réchauffe l'audio dès que le tableau est ciblé, pendant que la caméra glisse. */
-export function prefetchNarration(p: Painting, lang: Lang): void {
+/**
+ * Réchauffe l'audio avant qu'il soit demandé.
+ * `firstOnly` : ne précharge que le 1er morceau (tableau voisin, accueil) — une seule petite requête.
+ */
+export function prefetchNarration(p: Painting, lang: Lang, firstOnly = false): void {
   const voice = t('tts_voice', lang);
-  const key = ttsCacheKey(p, lang, voice);
-  if (ttsCache.has(key)) return;
-  const text = buildNarrationText(p, lang);
-  const promise = fetch('/tts', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ text, voice }),
-  })
-    .then(res => {
-      if (!res.ok) throw new Error('/tts ' + res.status);
-      return res.blob();
-    })
-    .catch(e => {
-      ttsCache.delete(key);
-      throw e;
-    });
-  promise.catch(() => {}); // évite « unhandled rejection » si personne n'attend ce prefetch
-  ttsCache.set(key, promise);
+  const chunks = splitNarration(buildNarrationText(p, lang));
+  (firstOnly ? chunks.slice(0, 1) : chunks).forEach(c => fetchAudio(c, voice));
+}
+
+/** Découpage des textes courts lus par le guide (introduction, annotations). */
+const SHORT_LIMITS = [100, 200, 300];
+
+/** Précharge un texte court (ex. une annotation) avant de le lire. */
+export function prefetchText(text: string, lang: Lang): void {
+  const voice = t('tts_voice', lang);
+  splitNarration(text, SHORT_LIMITS).forEach(c => fetchAudio(c, voice));
 }
 
 export function stopNarration(onStateChange?: (active: boolean) => void): void {
@@ -121,51 +209,37 @@ export function stopNarration(onStateChange?: (active: boolean) => void): void {
 
 export async function speakEdgeTTS(
   text: string,
-  p: Painting | null,
+  _p: Painting | null,
   lang: Lang,
   onStateChange?: (active: boolean) => void
 ): Promise<void> {
   const myToken = ++narrationToken;
   const voice = t('tts_voice', lang);
   if (onStateChange) onStateChange(true);
-  const cacheKey = p ? ttsCacheKey(p, lang, voice) : null;
 
-  try {
+  // Tous les morceaux sont demandés tout de suite, dans l'ordre ; on joue au fur et à mesure.
+  const chunks = splitNarration(text);
+  const audios = chunks.map(c => fetchAudio(c, voice));
+
+  for (let i = 0; i < chunks.length; i++) {
     let blob: Blob;
-    if (cacheKey && ttsCache.has(cacheKey)) {
-      blob = await ttsCache.get(cacheKey)!;
-    } else {
-      const res = await fetch('/tts', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text, voice }),
-      });
-      if (!res.ok) throw new Error('/tts ' + res.status);
-      blob = await res.blob();
+    try {
+      blob = await audios[i];
+    } catch (e: any) {
+      console.warn('[TTS]', e.message);
+      if (myToken === narrationToken) speakFallback(chunks.slice(i).join(' '), lang, onStateChange);
+      return;
     }
     if (myToken !== narrationToken) return;
-
-    const url = URL.createObjectURL(blob);
-    const a = player();
-    releasePlayer();
-    a.volume = NARRATION_VOLUME;
-    a.src = url;
-    a.onended = () => {
-      URL.revokeObjectURL(url);
-      if (myToken === narrationToken) stopNarration(onStateChange);
-    };
-    a.onerror = () => {
-      if (myToken === narrationToken) stopNarration(onStateChange);
-    };
-    await a.play();
+    const result = await playBlob(blob);
+    if (myToken !== narrationToken || result === 'aborted') return;
     isNarrating = true;
-  } catch (e: any) {
-    console.warn('[TTS]', e.message);
-    if (cacheKey) ttsCache.delete(cacheKey);
-    if (myToken === narrationToken) {
-      speakFallback(text, lang, onStateChange);
+    if (result === 'error') {
+      speakFallback(chunks.slice(i).join(' '), lang, onStateChange);
+      return;
     }
   }
+  if (myToken === narrationToken) stopNarration(onStateChange);
 }
 
 export function speakFallback(
@@ -217,6 +291,7 @@ export function haltSpeech(): void {
   }
 }
 
+/** Lit un texte court (intro / annotation) ; se résout à la fin ou quand on l'interrompt. */
 export function ttsPlay(text: string, lang: Lang): Promise<void> {
   const voice = t('tts_voice', lang);
   return new Promise(async resolve => {
@@ -227,36 +302,34 @@ export function ttsPlay(text: string, lang: Lang): Promise<void> {
         resolve();
       }
     };
+    // Même principe que la narration : morceaux demandés ensemble, joués à la suite.
+    const chunks = splitNarration(text, SHORT_LIMITS);
+    const audios = chunks.map(c => fetchAudio(c, voice));
+    let spokenUpTo = 0;
     try {
-      const res = await fetch('/tts', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text, voice }),
-      });
-      if (!res.ok) throw new Error('tts ' + res.status);
-      const blob = await res.blob();
-      if (_speechResolve !== resolve) return; // interrompu pendant le chargement
-      const url = URL.createObjectURL(blob);
-      const a = player();
-      releasePlayer();
-      a.volume = NARRATION_VOLUME;
-      a.src = url;
-      a.onended = () => {
-        URL.revokeObjectURL(url);
-        done();
-      };
-      a.onerror = done;
-      await a.play();
+      for (let i = 0; i < chunks.length; i++) {
+        const blob = await audios[i];
+        if (_speechResolve !== resolve) return; // interrompu pendant le chargement
+        const result = await playBlob(blob);
+        if (result === 'error') throw new Error('lecture impossible');
+        if (result === 'aborted' || _speechResolve !== resolve) {
+          done();
+          return;
+        }
+        spokenUpTo = i + 1;
+      }
+      done();
       return;
     } catch (_) {
-      /* repli : synthèse vocale du navigateur */
+      /* repli : synthèse vocale du navigateur pour ce qui reste */
     }
     if (_speechResolve !== resolve) return;
+    const rest = chunks.slice(spokenUpTo).join(' ') || text;
     if (typeof window === 'undefined' || !window.speechSynthesis) {
       done();
       return;
     }
-    const u = new SpeechSynthesisUtterance(text);
+    const u = new SpeechSynthesisUtterance(rest);
     const voices = window.speechSynthesis.getVoices();
     const v =
       voices.find(v => t('speech_voice_re', lang).test(v.name)) ||
