@@ -23,6 +23,15 @@ export const DetailZoomView: React.FC<DetailZoomViewProps> = ({
   const [pos, setPos] = useState({ x: 0, y: 0 });
   const [isDragging, setIsDragging] = useState(false);
   const [showHint, setShowHint] = useState(true);
+  // Écran large + visite guidée : on réserve des gouttières à gauche et à droite de l'image pour que les
+  // bulles d'annotation (reliées par une ligne) ne la recouvrent pas.
+  const [wide, setWide] = useState(() => typeof window !== 'undefined' && window.innerWidth >= 900);
+  useEffect(() => {
+    const on = () => setWide(window.innerWidth >= 900);
+    window.addEventListener('resize', on);
+    return () => window.removeEventListener('resize', on);
+  }, []);
+  const gutter = isGuiding && wide ? 280 : 0;
 
   // Gestes multi-pointeurs (souris, doigt, stylet)
   const pointers = useRef(new Map<number, { x: number; y: number }>());
@@ -205,7 +214,8 @@ export const DetailZoomView: React.FC<DetailZoomViewProps> = ({
         alt={painting.title}
         style={{
           transform: `translate(${pos.x}px, ${pos.y}px) scale(${scale})`,
-          transition: isDragging ? 'none' : 'transform 0.05s linear',
+          transition: isDragging ? 'none' : 'transform 0.05s linear, max-width .3s ease',
+          maxWidth: gutter ? `calc(100vw - ${gutter * 2}px)` : undefined,
         }}
         className="max-w-[95vw] max-h-[95vh] select-none pointer-events-none origin-center shadow-[0_30px_80px_rgba(0,0,0,0.8)]"
       />
