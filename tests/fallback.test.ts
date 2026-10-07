@@ -17,6 +17,7 @@ assert.equal(classify(err(401)).retry, false);
 assert.equal(classify(err(403)).retry, false);
 assert.equal(classify(new Error('JSON invalide : réponse vide')).retry, true);
 assert.equal(classify(new Error('JSON invalide : réponse vide')).cooldownMs, 0); // mauvaise sortie ≠ panne
+assert.equal(classify(new Error('JSON invalide : langue incorrecte')).cooldownMs, 120_000);
 assert.equal(classify(new Error('fetch failed')).retry, true);
 assert.equal(classify(new Error('bug interne')).retry, false);
 
