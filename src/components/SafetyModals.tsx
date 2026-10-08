@@ -312,223 +312,99 @@ export const FeedbackModal: React.FC<FeedbackModalProps> = ({
   };
 
   return (
-    <div id="feedback-overlay" className="fixed inset-0 z-[95] bg-[#060812]/85 backdrop-blur-[6px] flex items-center justify-center p-3 sm:p-4">
-      <div
-        className="safety-card fb-card max-w-[540px] w-full p-4 sm:p-6 sm:py-5 rounded-3xl border border-[rgba(180,200,230,0.22)] shadow-2xl"
-        style={{ background: 'var(--glass-night)' }}
-      >
+    <div id="feedback-overlay" role="dialog" aria-modal="true" aria-labelledby="feedback-title">
+      <div className="safety-card fb-card">
         {status === 'sent' ? (
-          <div style={{ textAlign: 'center', padding: '16px 0' }}>
-            <svg viewBox="0 0 24 24" width="36" height="36" fill="currentColor" style={{ color: 'var(--amber)', margin: '0 auto 10px' }}>
+          <div className="fb-thanks">
+            <svg viewBox="0 0 24 24" width="30" height="30" fill="currentColor" style={{ color: 'var(--amber)', margin: '0 auto 10px' }}>
               <path d="M12 21s-6.7-4.35-9.3-8.6C1 9.7 1.7 6.4 4.4 4.9c2.3-1.3 4.9-.6 6.4 1.3l1.2 1.5 1.2-1.5c1.5-1.9 4.1-2.6 6.4-1.3 2.7 1.5 3.4 4.8 1.7 7.5C18.7 16.65 12 21 12 21z" />
             </svg>
-            <h3 className="safety-title text-xl font-serif italic text-[#f4f0e6] mb-1.5">
-              {t('feedback_thanks_title', lang)}
-            </h3>
-            <p className="safety-text text-xs sm:text-sm text-[#f4f0e6]/75 mb-5">
-              {t('feedback_thanks_text', lang)}
-            </p>
-            <button type="button" onClick={onClose} className="fb-submit py-2.5 text-xs" style={{ maxWidth: 180, margin: '0 auto' }}>
+            <p className="safety-title">{t('feedback_thanks_title', lang)}</p>
+            <p className="safety-text">{t('feedback_thanks_text', lang)}</p>
+            <button type="button" onClick={onClose} className="fb-submit" style={{ maxWidth: 200, margin: '.4rem auto 0', display: 'block' }}>
               {t('close_generic', lang)}
             </button>
           </div>
         ) : (
-          <div className="flex flex-col gap-2.5">
-            {/* Header with Title & Stars */}
-            <div className="text-center">
-              <h3 className="font-serif italic text-lg sm:text-xl text-[#f4f0e6] leading-tight mb-0.5">
-                {t('feedback_title', lang)}
-              </h3>
-              <p className="font-sans text-[11px] sm:text-xs text-[#f4f0e6]/65">
-                {t('feedback_subtitle', lang)}
-              </p>
+          <div>
+            <p className="safety-title" id="feedback-title">{t('feedback_title', lang)}</p>
+            <p className="safety-text">{t('feedback_subtitle', lang)}</p>
 
-              {/* STAR RATING */}
-              <div className="flex gap-1.5 justify-center mt-1.5 mb-1">
+            <div className="fb-scroll">
+              {/* Étoiles */}
+              <div className="fb-stars">
                 {[1, 2, 3, 4, 5].map(star => (
                   <button
                     key={star}
                     type="button"
                     onClick={() => setRating(star)}
-                    className="p-1 cursor-pointer transition-transform hover:scale-110"
+                    className={`fb-star-btn ${star <= rating ? 'on' : ''}`}
                     title={`${star} / 5`}
+                    aria-label={`${star} / 5`}
                   >
-                    <svg viewBox="0 0 24 24" width="22" height="22" fill={star <= rating ? 'var(--amber)' : 'none'} stroke={star <= rating ? 'var(--amber)' : 'rgba(244,240,230,0.35)'} strokeWidth="1.5">
+                    <svg viewBox="0 0 24 24" width="28" height="28" fill={star <= rating ? 'currentColor' : 'none'} stroke="currentColor" strokeWidth="1.4">
                       <polygon points="12 2 15 9 22 9.5 17 14.5 18.5 22 12 18 5.5 22 7 14.5 2 9.5 9 9" />
                     </svg>
                   </button>
                 ))}
               </div>
-            </div>
 
-            {/* QUESTIONS - Compact Grid (fits without scrolling) */}
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5 text-left">
-              {/* Question 1 */}
-              <div className="bg-[#f4f0e6]/[0.03] border border-[#f4f0e6]/10 rounded-xl p-2 sm:p-2.5 flex items-center justify-between gap-2">
-                <span className="text-[11px] sm:text-[11.5px] font-sans text-[#f4f0e6]/85 leading-tight">
-                  {t('fb_q_empty_frame_label', lang)}
-                </span>
-                <div className="flex gap-1 shrink-0">
-                  <button
-                    type="button"
-                    onClick={() => setEmptyFrame(true)}
-                    className={`px-2.5 py-1 text-[10.5px] font-sans font-medium rounded-full border transition-all ${
-                      emptyFrame === true
-                        ? 'bg-[#e8b979]/25 border-[#e8b979] text-[#f4f0e6] shadow-[0_0_8px_rgba(232,185,121,0.2)]'
-                        : 'bg-[#f4f0e6]/[0.05] border-[#f4f0e6]/20 text-[#f4f0e6]/65 hover:text-[#f4f0e6]'
-                    }`}
-                  >
-                    {t('yes_label', lang)}
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setEmptyFrame(false)}
-                    className={`px-2.5 py-1 text-[10.5px] font-sans font-medium rounded-full border transition-all ${
-                      emptyFrame === false
-                        ? 'bg-[#e8b979]/25 border-[#e8b979] text-[#f4f0e6] shadow-[0_0_8px_rgba(232,185,121,0.2)]'
-                        : 'bg-[#f4f0e6]/[0.05] border-[#f4f0e6]/20 text-[#f4f0e6]/65 hover:text-[#f4f0e6]'
-                    }`}
-                  >
-                    {t('no_label', lang)}
-                  </button>
-                </div>
+              <div className="fb-question">
+                <div className="fb-question-label">{t('fb_q_empty_frame_label', lang)}</div>
+                <div className="fb-question-hint">{t('fb_q_empty_frame_hint', lang)}</div>
+                <YesNo value={emptyFrame} onChange={setEmptyFrame} lang={lang} />
               </div>
 
-              {/* Question 2 */}
-              <div className="bg-[#f4f0e6]/[0.03] border border-[#f4f0e6]/10 rounded-xl p-2 sm:p-2.5 flex items-center justify-between gap-2">
-                <span className="text-[11px] sm:text-[11.5px] font-sans text-[#f4f0e6]/85 leading-tight">
-                  {t('fb_q_resonate_label', lang)}
-                </span>
-                <div className="flex gap-1 shrink-0">
-                  <button
-                    type="button"
-                    onClick={() => setResonated(true)}
-                    className={`px-2.5 py-1 text-[10.5px] font-sans font-medium rounded-full border transition-all ${
-                      resonated === true
-                        ? 'bg-[#e8b979]/25 border-[#e8b979] text-[#f4f0e6] shadow-[0_0_8px_rgba(232,185,121,0.2)]'
-                        : 'bg-[#f4f0e6]/[0.05] border-[#f4f0e6]/20 text-[#f4f0e6]/65 hover:text-[#f4f0e6]'
-                    }`}
-                  >
-                    {t('yes_label', lang)}
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setResonated(false)}
-                    className={`px-2.5 py-1 text-[10.5px] font-sans font-medium rounded-full border transition-all ${
-                      resonated === false
-                        ? 'bg-[#e8b979]/25 border-[#e8b979] text-[#f4f0e6] shadow-[0_0_8px_rgba(232,185,121,0.2)]'
-                        : 'bg-[#f4f0e6]/[0.05] border-[#f4f0e6]/20 text-[#f4f0e6]/65 hover:text-[#f4f0e6]'
-                    }`}
-                  >
-                    {t('no_label', lang)}
-                  </button>
-                </div>
+              <div className="fb-question">
+                <div className="fb-question-label">{t('fb_q_resonate_label', lang)}</div>
+                <YesNo value={resonated} onChange={setResonated} lang={lang} />
               </div>
 
-              {/* Question 3 */}
-              <div className="bg-[#f4f0e6]/[0.03] border border-[#f4f0e6]/10 rounded-xl p-2 sm:p-2.5 flex items-center justify-between gap-2">
-                <span className="text-[11px] sm:text-[11.5px] font-sans text-[#f4f0e6]/85 leading-tight">
-                  {t('fb_q_surprised_label', lang)}
-                </span>
-                <div className="flex gap-1 shrink-0">
-                  <button
-                    type="button"
-                    onClick={() => setSurprised(true)}
-                    className={`px-2.5 py-1 text-[10.5px] font-sans font-medium rounded-full border transition-all ${
-                      surprised === true
-                        ? 'bg-[#e8b979]/25 border-[#e8b979] text-[#f4f0e6] shadow-[0_0_8px_rgba(232,185,121,0.2)]'
-                        : 'bg-[#f4f0e6]/[0.05] border-[#f4f0e6]/20 text-[#f4f0e6]/65 hover:text-[#f4f0e6]'
-                    }`}
-                  >
-                    {t('yes_label', lang)}
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setSurprised(false)}
-                    className={`px-2.5 py-1 text-[10.5px] font-sans font-medium rounded-full border transition-all ${
-                      surprised === false
-                        ? 'bg-[#e8b979]/25 border-[#e8b979] text-[#f4f0e6] shadow-[0_0_8px_rgba(232,185,121,0.2)]'
-                        : 'bg-[#f4f0e6]/[0.05] border-[#f4f0e6]/20 text-[#f4f0e6]/65 hover:text-[#f4f0e6]'
-                    }`}
-                  >
-                    {t('no_label', lang)}
-                  </button>
-                </div>
+              <div className="fb-question">
+                <div className="fb-question-label">{t('fb_q_surprised_label', lang)}</div>
+                <YesNo value={surprised} onChange={setSurprised} lang={lang} />
               </div>
 
-              {/* Question 4 */}
-              <div className="bg-[#f4f0e6]/[0.03] border border-[#f4f0e6]/10 rounded-xl p-2 sm:p-2.5 flex items-center justify-between gap-2">
-                <span className="text-[11px] sm:text-[11.5px] font-sans text-[#f4f0e6]/85 leading-tight">
-                  {t('fb_q_recommend_label', lang)}
-                </span>
-                <div className="flex gap-1 shrink-0">
-                  <button
-                    type="button"
-                    onClick={() => setWouldRecommend(true)}
-                    className={`px-2.5 py-1 text-[10.5px] font-sans font-medium rounded-full border transition-all ${
-                      wouldRecommend === true
-                        ? 'bg-[#e8b979]/25 border-[#e8b979] text-[#f4f0e6] shadow-[0_0_8px_rgba(232,185,121,0.2)]'
-                        : 'bg-[#f4f0e6]/[0.05] border-[#f4f0e6]/20 text-[#f4f0e6]/65 hover:text-[#f4f0e6]'
-                    }`}
-                  >
-                    {t('yes_label', lang)}
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setWouldRecommend(false)}
-                    className={`px-2.5 py-1 text-[10.5px] font-sans font-medium rounded-full border transition-all ${
-                      wouldRecommend === false
-                        ? 'bg-[#e8b979]/25 border-[#e8b979] text-[#f4f0e6] shadow-[0_0_8px_rgba(232,185,121,0.2)]'
-                        : 'bg-[#f4f0e6]/[0.05] border-[#f4f0e6]/20 text-[#f4f0e6]/65 hover:text-[#f4f0e6]'
-                    }`}
-                  >
-                    {t('no_label', lang)}
-                  </button>
-                </div>
+              <div className="fb-question">
+                <div className="fb-question-label">{t('fb_q_recommend_label', lang)}</div>
+                <YesNo value={wouldRecommend} onChange={setWouldRecommend} lang={lang} />
+                {wouldRecommend === false && (
+                  <textarea
+                    className="fb-textarea"
+                    rows={2}
+                    value={whyNot}
+                    onChange={e => setWhyNot(e.target.value)}
+                    placeholder={t('feedback_why_not_placeholder', lang)}
+                    style={{ marginTop: '.6rem' }}
+                  />
+                )}
               </div>
-            </div>
 
-            {/* Why not? if recommendation was declined */}
-            {wouldRecommend === false && (
-              <input
-                type="text"
-                value={whyNot}
-                onChange={e => setWhyNot(e.target.value)}
-                placeholder={t('feedback_why_not_placeholder', lang)}
-                className="w-full px-3 py-1.5 rounded-lg bg-[#f4f0e6]/[0.05] border border-[#f4f0e6]/20 text-[#f4f0e6] font-sans text-xs outline-none focus:border-[#e8b979]/60"
+              <textarea
+                className="fb-textarea"
+                rows={3}
+                value={comment}
+                onChange={e => setComment(e.target.value)}
+                placeholder={t('feedback_comment_placeholder', lang)}
               />
-            )}
+            </div>
 
-            {/* Comment input */}
-            <input
-              type="text"
-              value={comment}
-              onChange={e => setComment(e.target.value)}
-              placeholder={t('feedback_comment_placeholder', lang)}
-              className="w-full px-3 py-2 rounded-xl bg-[#f4f0e6]/[0.05] border border-[#f4f0e6]/20 text-[#f4f0e6] font-sans text-xs outline-none focus:border-[#e8b979]/60 placeholder:text-[#f4f0e6]/35"
-            />
+            {status === 'error' && <p className="fb-error">{t('feedback_error', lang)}</p>}
 
-            {status === 'error' && (
-              <p className="text-center font-sans text-[11px] text-rose-300">{t('feedback_error', lang)}</p>
-            )}
-
-            {/* Action buttons */}
-            <div className="flex items-center gap-2 pt-1">
-              <button
-                type="button"
-                onClick={onClose}
-                className="px-4 py-2 text-xs font-sans text-[#f4f0e6]/70 hover:text-[#f4f0e6] cursor-pointer"
+            <button type="button" className="fb-submit" disabled={!hasAnyAnswer || status === 'sending'} onClick={handleSubmit}>
+              {status === 'sending' ? t('feedback_sending', lang) : t('feedback_submit', lang)}
+            </button>
+            <div className="home-confirm-actions safety-actions" style={{ marginTop: '.8rem' }}>
+              <a
+                href="#"
+                className="safety-link-action"
+                onClick={e => {
+                  e.preventDefault();
+                  onClose();
+                }}
               >
                 {t('feedback_cancel', lang)}
-              </button>
-              <button
-                type="button"
-                disabled={!hasAnyAnswer || status === 'sending'}
-                onClick={handleSubmit}
-                className="flex-1 py-2.5 px-4 font-sans text-[11px] font-bold tracking-[0.16em] uppercase text-[#f4f0e6] bg-[#f4f0e6]/[0.16] border border-[#f4f0e6]/45 rounded-full cursor-pointer disabled:opacity-35 disabled:cursor-not-allowed hover:enabled:bg-[#f4f0e6]/25 transition-all duration-200"
-              >
-                {status === 'sending' ? t('feedback_sending', lang) : t('feedback_submit', lang)}
-              </button>
+              </a>
             </div>
           </div>
         )}
@@ -536,3 +412,15 @@ export const FeedbackModal: React.FC<FeedbackModalProps> = ({
     </div>
   );
 };
+
+/** Pastilles Oui / Non (mêmes classes que l'original). */
+const YesNo: React.FC<{ value: boolean | null; onChange: (v: boolean) => void; lang: Lang }> = ({ value, onChange, lang }) => (
+  <div className="fb-row" style={{ marginTop: '.55rem' }}>
+    <button type="button" className={`fb-pill ${value === true ? 'selected' : ''}`} onClick={() => onChange(true)}>
+      {t('yes_label', lang)}
+    </button>
+    <button type="button" className={`fb-pill ${value === false ? 'selected' : ''}`} onClick={() => onChange(false)}>
+      {t('no_label', lang)}
+    </button>
+  </div>
+);
