@@ -19,6 +19,7 @@ import {
 import { synthesize, MAX_TTS_CHARS } from './server/tts.ts';
 import { DEFAULT_TEXT_MODELS, parseModels, withFallback } from './server/fallback.ts';
 import { languageMismatch, languageSystemInstruction } from './src/shared/lang.ts';
+import { checkStorage, describeConfig, sanitizeFeedback, sanitizeReport, saveRecord } from './server/storage.ts';
 
 dotenv.config();
 
@@ -280,16 +281,42 @@ app.post('/api/annotate', rateLimit(30), async (req, res) => {
   }
 });
 
-// ─── POST /api/report — Artwork reporting ───
-app.post('/api/report', (req, res) => {
-  console.log('[Report Received]', req.body);
-  res.json({ ok: true, received: true });
-});
+// ─── Retours visiteurs : signalements d'œuvres et feedback → dataset Hugging Face ───
+// (voir server/storage.ts ; sans configuration, repli sur un fichier local éphémère)
+const storageStatus = describeConfig();
+console.log(
+  storageStatus.configured
+    ? `Retours visiteurs → Hugging Face dataset « ${storageStatus.dataset} » (jeton : ${storageStatus.token_variable}, dataset : ${storageStatus.dataset_variable})`
+    : `Retours visiteurs → fichier LOCAL éphémère : HF_TOKEN et/ou dataset non détectés (jetons vus : ${storageStatus.token_variables_found.join(', ') || 'aucun'} ; datasets vus : ${storageStatus.dataset_variables_found.join(', ') || 'aucun'})`
+);
 
-// ─── POST /api/feedback — Gallery visit feedback ───
-app.post('/api/feedback', (req, res) => {
-  console.log('[Feedback Received]', req.body);
-  res.json({ ok: true, received: true });
+function recordHandler(kind: 'feedback' | 'reports', clean: (b: any) => object | null, label: string) {
+  return async (req: express.Request, res: express.Response) => {
+    const rec = clean(req.body);
+    if (!rec) return res.status(400).json({ ok: false, error: 'invalid payload' });
+    try {
+      const saved = await saveRecord(kind, rec);
+      console.log(`[${label}] enregistré (${saved.backend}) : ${saved.where}`);
+      res.json({ ok: true, stored: saved.backend });
+    } catch (err: any) {
+      // On répond par une erreur : le visiteur voit « impossible d'envoyer » au lieu d'un faux merci
+      console.error(`[${label}] ENREGISTREMENT IMPOSSIBLE :`, err.message || err);
+      res.status(502).json({ ok: false, error: 'storage unavailable' });
+    }
+  };
+}
+
+// ─── POST /api/report — signalement d'une œuvre ───
+app.post('/api/report', rateLimit(10), recordHandler('reports', sanitizeReport, 'Report'));
+
+// ─── POST /api/feedback — avis sur la visite ───
+app.post('/api/feedback', rateLimit(10), recordHandler('feedback', sanitizeFeedback, 'Feedback'));
+
+// ─── GET /api/storage-status — diagnostic (jamais le jeton) ───
+// /api/storage-status          : ce que le serveur détecte
+// /api/storage-status?check=1  : teste vraiment le jeton et l'accès en écriture au dataset
+app.get('/api/storage-status', rateLimit(20), async (req, res) => {
+  res.json(req.query.check ? await checkStorage() : describeConfig());
 });
 
 // ─── POST /tts — narration vocale (Edge TTS, puis Gemini TTS en secours) ───
