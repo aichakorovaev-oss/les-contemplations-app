@@ -20,31 +20,59 @@ let _speechResolve: (() => void) | null = null;
 const audioCache = new Map<string, Promise<Blob>>();
 const MAX_CACHED = 48;
 
+const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
+
+async function fetchOnce(text: string, voice: string): Promise<Blob> {
+  const res = await fetch('/tts', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text, voice }),
+  });
+  if (!res.ok) throw Object.assign(new Error('/tts ' + res.status), { status: res.status });
+  return res.blob();
+}
+
+/**
+ * Un échec passager (quota 429, 5xx, réseau) ne doit PAS faire basculer sur la voix robotique du
+ * navigateur : on réessaie d'abord, avec un petit délai croissant. Inutile pour 400 / 501.
+ */
+const RETRY_DELAYS = [700, 1700];
+async function fetchWithRetry(text: string, voice: string): Promise<Blob> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await fetchOnce(text, voice);
+    } catch (e: any) {
+      const status: number | undefined = e?.status;
+      const retryable = status === undefined || status === 429 || status >= 500;
+      if (!retryable || status === 501 || attempt >= RETRY_DELAYS.length) throw e;
+      await sleep(RETRY_DELAYS[attempt] + Math.random() * 300);
+    }
+  }
+}
+
 function fetchAudio(text: string, voice: string): Promise<Blob> {
   const key = `${voice}|${text}`;
   const hit = audioCache.get(key);
   if (hit) return hit;
-  const p = fetch('/tts', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ text, voice }),
-  })
-    .then(res => {
-      if (!res.ok) throw new Error('/tts ' + res.status);
-      return res.blob();
-    })
-    .catch(e => {
-      audioCache.delete(key); // un échec ne doit pas rester en cache
-      throw e;
-    });
+  const p = fetchWithRetry(text, voice).catch(e => {
+    audioCache.delete(key); // un échec ne doit pas rester en cache
+    throw e;
+  });
   p.catch(() => {}); // évite « unhandled rejection » pour un préchargement que personne n'attend
   audioCache.set(key, p);
   while (audioCache.size > MAX_CACHED) audioCache.delete(audioCache.keys().next().value as string);
   return p;
 }
 
+/**
+ * Voix robotique du navigateur, en tout dernier recours : seulement si la voix naturelle est
+ * indisponible dès le DÉBUT d'une narration (jamais au milieu : on ne mélange pas deux voix).
+ * Mettre false pour préférer le silence.
+ */
+const ROBOT_FALLBACK = true;
+
 /** Découpe un texte en morceaux dont la taille augmente : le 1er est court pour démarrer vite. */
-export function splitNarration(text: string, limits: number[] = [110, 170, 260, 320]): string[] {
+export function splitNarration(text: string, limits: number[] = [110, 220, 520]): string[] {
   const clean = text.replace(/\s+/g, ' ').trim();
   if (!clean) return [];
   const sentences = (clean.match(/[^.!?…]+(?:[.!?…]+["»”)]*|$)/g) || [clean]).map(s => s.trim()).filter(Boolean);
@@ -227,7 +255,10 @@ export async function speakEdgeTTS(
       blob = await audios[i];
     } catch (e: any) {
       console.warn('[TTS]', e.message);
-      if (myToken === narrationToken) speakFallback(chunks.slice(i).join(' '), lang, onStateChange);
+      if (myToken !== narrationToken) return;
+      // 1er morceau : voix du navigateur en dernier recours. Plus tard : on s'arrête, sans changer de voix.
+      if (i === 0 && ROBOT_FALLBACK) speakFallback(chunks.join(' '), lang, onStateChange);
+      else stopNarration(onStateChange);
       return;
     }
     if (myToken !== narrationToken) return;
@@ -235,7 +266,8 @@ export async function speakEdgeTTS(
     if (myToken !== narrationToken || result === 'aborted') return;
     isNarrating = true;
     if (result === 'error') {
-      speakFallback(chunks.slice(i).join(' '), lang, onStateChange);
+      if (i === 0 && ROBOT_FALLBACK) speakFallback(chunks.join(' '), lang, onStateChange);
+      else stopNarration(onStateChange);
       return;
     }
   }
@@ -321,10 +353,15 @@ export function ttsPlay(text: string, lang: Lang): Promise<void> {
       done();
       return;
     } catch (_) {
-      /* repli : synthèse vocale du navigateur pour ce qui reste */
+      /* voir ci-dessous */
     }
     if (_speechResolve !== resolve) return;
-    const rest = chunks.slice(spokenUpTo).join(' ') || text;
+    // Voix naturelle déjà entamée : on n'y mêle pas la voix robotique
+    if (spokenUpTo > 0 || !ROBOT_FALLBACK) {
+      done();
+      return;
+    }
+    const rest = text;
     if (typeof window === 'undefined' || !window.speechSynthesis) {
       done();
       return;
