@@ -292,16 +292,16 @@ app.post('/api/feedback', (req, res) => {
   res.json({ ok: true, received: true });
 });
 
-// ─── POST /tts — narration vocale (Gemini TTS) ───
-// Renvoie un WAV. En cas d'échec le client bascule sur la voix du navigateur.
-app.post('/tts', rateLimit(60), async (req, res) => {
+// ─── POST /tts — narration vocale (Edge TTS, puis Gemini TTS en secours) ───
+// Renvoie du MP3 ou du WAV. Si tous les moteurs échouent, le client réessaie puis, en dernier recours,
+// bascule sur la voix du navigateur.
+app.post('/tts', rateLimit(150), async (req, res) => {
   const text = clampText(req.body?.text, MAX_TTS_CHARS);
   if (!text) return res.status(400).json({ error: 'text required' });
-  if (!geminiApiKey) return res.status(501).json({ error: 'GEMINI_API_KEY not configured' });
   try {
-    const wav = await synthesize(text, req.body?.voice, geminiApiKey);
-    res.set({ 'Content-Type': 'audio/wav', 'Cache-Control': 'private, max-age=86400' });
-    res.send(wav);
+    const { data, type } = await synthesize(text, req.body?.voice, geminiApiKey);
+    res.set({ 'Content-Type': type, 'Cache-Control': 'private, max-age=86400' });
+    res.send(data);
   } catch (err: any) {
     console.error('TTS error:', err.message || err);
     res.status(502).json({ error: 'TTS unavailable' });

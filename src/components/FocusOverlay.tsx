@@ -9,6 +9,8 @@ interface FocusOverlayProps {
   isNarrating: boolean;
   isGuiding: boolean;
   isGuideLoading: boolean;
+  /** décision du visiteur pour les œuvres sensibles : true = a accepté de les voir */
+  nudityConsent: boolean | null;
   onToggleInfo: () => void;
   onCloseInfo: () => void;
   onZoom: () => void;
@@ -27,6 +29,7 @@ export const FocusOverlay: React.FC<FocusOverlayProps> = ({
   isNarrating,
   isGuiding,
   isGuideLoading,
+  nudityConsent,
   onToggleInfo,
   onCloseInfo,
   onZoom,
@@ -37,7 +40,9 @@ export const FocusOverlay: React.FC<FocusOverlayProps> = ({
   onNext,
   onToggleNarration,
 }) => {
-  const isGated = !!(painting.nudity || painting.graphic);
+  // Œuvre voilée tant que le visiteur n'a pas accepté de la voir : le bouton « signaler » est alors
+  // masqué (on ne signale pas ce qu'on n'a pas vu) et réapparaît dès l'acceptation.
+  const isGated = !!(painting.nudity || painting.graphic) && nudityConsent !== true;
 
   return (
     <div id="focus-overlay" className="fixed inset-0 z-20 pointer-events-none">

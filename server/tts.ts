@@ -1,15 +1,16 @@
 /**
  * Synthèse vocale côté serveur pour la narration (route POST /tts).
  *
- * L'original appelait un serveur Edge-TTS externe ; le portage n'avait qu'un
- * stub 501, ce qui faisait retomber TOUTES les narrations sur la voix du
- * navigateur. Ici on utilise l'API Gemini TTS (même clé GEMINI_API_KEY),
- * documentée sur https://ai.google.dev/gemini-api/docs/speech-generation
+ * Moteurs essayés dans l'ordre (TTS_ENGINES, défaut « edge,gemini ») :
+ *   1. Edge TTS  — voix neurales Microsoft, comme la version d'origine : rapide, sans quota.
+ *   2. Gemini TTS — modèles listés dans TTS_MODELS (même clé GEMINI_API_KEY), en secours.
+ * Un moteur en échec est mis en pause quelques minutes (voir fallback.ts).
  *
- * Le client n'a rien à changer : il envoie { text, voice } et reçoit un WAV.
+ * Réponse : { data, type } — MP3 (Edge) ou WAV (Gemini). Le client n'a rien à savoir du moteur utilisé.
  */
 import { createHash } from 'crypto';
 import { DEFAULT_TTS_MODELS, parseModels, withFallback } from './fallback.ts';
+import { synthesizeEdge } from './edge.ts';
 
 const ENDPOINT = () => (process.env.GOOGLE_GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com') + '/v1beta/interactions';
 // Modèles vocaux par ordre de préférence (même schéma de requête) : TTS_MODELS="a,b" et/ou TTS_MODEL="a".
@@ -75,57 +76,111 @@ export function ensureWav(buf: Buffer, sampleRate = 24000): Buffer {
   return Buffer.concat([h, buf]);
 }
 
-// Petit cache LRU en mémoire : une même narration n'est facturée qu'une fois.
-const cache = new Map<string, Buffer>();
+// ── Cache LRU en mémoire : une même narration n'est synthétisée qu'une fois ──
+export interface Synthesized {
+  data: Buffer;
+  type: string;
+}
+const cache = new Map<string, Synthesized>();
 let cacheBytes = 0;
 const MAX_CACHE_BYTES = 48 * 1024 * 1024;
 
-function cacheSet(key: string, val: Buffer) {
+function cacheSet(key: string, val: Synthesized) {
   cache.set(key, val);
-  cacheBytes += val.length;
+  cacheBytes += val.data.length;
   while (cacheBytes > MAX_CACHE_BYTES && cache.size > 1) {
     const oldest = cache.keys().next().value as string;
-    cacheBytes -= cache.get(oldest)!.length;
+    cacheBytes -= cache.get(oldest)!.data.length;
     cache.delete(oldest);
   }
 }
 
-export async function synthesize(text: string, requestedVoice: unknown, apiKey: string): Promise<Buffer> {
+// Requêtes identiques simultanées (préchargement + lecture) : une seule synthèse
+const inflight = new Map<string, Promise<Synthesized>>();
+
+// File d'attente pour Gemini : limite les appels simultanés, sinon une rafale de morceaux
+// dépasse le quota par minute et la voix retombe sur la synthèse robotique du navigateur.
+class Semaphore {
+  private waiters: (() => void)[] = [];
+  constructor(private slots: number) {}
+  async run<T>(fn: () => Promise<T>): Promise<T> {
+    if (this.slots > 0) this.slots--;
+    else await new Promise<void>(r => this.waiters.push(r));
+    try {
+      return await fn();
+    } finally {
+      const next = this.waiters.shift();
+      if (next) next();
+      else this.slots++;
+    }
+  }
+}
+const geminiQueue = new Semaphore(Number(process.env.TTS_GEMINI_CONCURRENCY) || 2);
+
+/** Liste ordonnée des moteurs : 'edge' puis les modèles Gemini (selon TTS_ENGINES). */
+export function engineList(): string[] {
+  const engines = (process.env.TTS_ENGINES || 'edge,gemini')
+    .split(',')
+    .map(e => e.trim().toLowerCase())
+    .filter(Boolean);
+  const out: string[] = [];
+  for (const e of engines) {
+    if (e === 'edge') out.push('edge');
+    else if (e === 'gemini') out.push(...MODELS());
+  }
+  return out.length ? out : MODELS();
+}
+
+async function synthesizeGemini(text: string, requestedVoice: unknown, model: string, apiKey: string): Promise<Synthesized> {
   const voice = voiceFor(requestedVoice);
-  const key = createHash('sha1').update(`${voice}|${STYLE()}|${text}`).digest('hex');
+  return geminiQueue.run(async () => {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 40_000);
+    try {
+      const res = await fetch(ENDPOINT(), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
+        body: JSON.stringify(buildTtsRequest(text, voice, model)),
+        signal: ctrl.signal,
+      });
+      if (!res.ok) {
+        throw Object.assign(new Error(`Gemini TTS ${res.status}: ${(await res.text()).slice(0, 200)}`), {
+          status: res.status,
+        });
+      }
+      const b64 = extractAudioBase64(await res.json());
+      if (!b64) throw new Error('Gemini TTS: JSON invalide : aucune donnée audio dans la réponse');
+      return { data: ensureWav(Buffer.from(b64, 'base64')), type: 'audio/wav' };
+    } finally {
+      clearTimeout(timer);
+    }
+  });
+}
+
+export async function synthesize(text: string, requestedVoice: unknown, apiKey: string | undefined): Promise<Synthesized> {
+  const key = createHash('sha1').update(`${String(requestedVoice)}|${STYLE()}|${text}`).digest('hex');
   const hit = cache.get(key);
   if (hit) {
     cache.delete(key);
     cache.set(key, hit); // rafraîchit l'ordre LRU
     return hit;
   }
+  const pending = inflight.get(key);
+  if (pending) return pending;
 
-  const wav = await withFallback(
-    MODELS(),
-    async model => {
-      const ctrl = new AbortController();
-      const timer = setTimeout(() => ctrl.abort(), 40_000);
-      try {
-        const res = await fetch(ENDPOINT(), {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
-          body: JSON.stringify(buildTtsRequest(text, voice, model)),
-          signal: ctrl.signal,
-        });
-        if (!res.ok) {
-          throw Object.assign(new Error(`Gemini TTS ${res.status}: ${(await res.text()).slice(0, 200)}`), {
-            status: res.status,
-          });
-        }
-        const b64 = extractAudioBase64(await res.json());
-        if (!b64) throw new Error('Gemini TTS: JSON invalide : aucune donnée audio dans la réponse');
-        return ensureWav(Buffer.from(b64, 'base64'));
-      } finally {
-        clearTimeout(timer);
-      }
-    },
-    { label: 'Gemini TTS', attemptTimeoutMs: 45_000, budgetMs: 70_000 }
-  );
-  cacheSet(key, wav);
-  return wav;
+  const engines = engineList().filter(e => e === 'edge' || !!apiKey);
+  const job = withFallback(
+    engines,
+    async engine => (engine === 'edge'
+      ? { data: await synthesizeEdge(text, requestedVoice), type: 'audio/mpeg' }
+      : synthesizeGemini(text, requestedVoice, engine, apiKey!)),
+    { label: 'TTS', attemptTimeoutMs: 45_000, timeoutFor: e => (e === 'edge' ? 9_000 : undefined), budgetMs: 70_000 }
+  )
+    .then(out => {
+      cacheSet(key, out);
+      return out;
+    })
+    .finally(() => inflight.delete(key));
+  inflight.set(key, job);
+  return job;
 }

@@ -75,24 +75,25 @@ function detectCrisisSignal(text: string): boolean {
 
 /**
  * Distance caméra + décalage du point visé pour cadrer un tableau.
- * - Écran large : comportement d'origine (le tableau occupe ~43 % de la hauteur).
- * - Portrait (téléphone / tablette) : le tableau remplit ~88 % de la largeur et se place
- *   au-dessus de la zone basse réservée à la légende, à la navigation et aux annotations.
- * - Paysage court (téléphone couché) : le tableau remplit ~80 % de la hauteur, avec de la
+ * - Tablette et ordinateur : comportement d'origine (le tableau occupe ~43 % de la dimension limitante).
+ * - Téléphone en portrait : le tableau remplit ~70 % de la largeur et se place au-dessus de la zone
+ *   réservée à la légende, à la navigation et aux annotations.
+ * - Téléphone en paysage (écran très bas) : le tableau remplit ~80 % de la hauteur, avec de la
  *   place de chaque côté pour les bulles d'annotation.
  */
 export function computeFocusFit(pw: number, ph: number, vfov: number, hfov: number, W: number, H: number) {
   const tanV = Math.tan(vfov / 2);
   const tanH = Math.tan(hfov / 2);
   const aspect = W / H;
+  const phone = Math.min(W, H) < 600; // les tablettes gardent le cadrage d'origine
   let fillW: number, fillH: number, reserveTop = 0, reserveBottom = 0;
 
-  if (aspect < 1) {
+  if (phone && aspect < 1) {
     reserveTop = Math.min(72, H * 0.09);
     reserveBottom = Math.min(190, H * 0.24);
-    fillW = 0.8;
+    fillW = 0.7;
     fillH = Math.max(0.3, (H - reserveTop - reserveBottom) / H - 0.04);
-  } else if (H < 520) {
+  } else if (phone && H < 520) {
     fillW = 0.62;
     fillH = 0.8;
   } else {
@@ -208,6 +209,8 @@ export default function App() {
   const moodTextRef = useRef('');
   moodTextRef.current = userMoodText;
   const langSwitchTokenRef = useRef(0);
+  const tweaksRef = useRef(tweaks);
+  tweaksRef.current = tweaks;
 
   // Changement de langue : on retraduit le catalogue ET les textes générés par l'IA
   // (méditation, raison, anecdote, questions, annotations, accueil), sinon on mélange les langues.
@@ -481,12 +484,22 @@ export default function App() {
     });
   }, []);
 
-  // Check consent before showing sensitive work
+  // Check consent before showing sensitive work.
+  // Si le visiteur accepte de dévoiler l'œuvre qu'il est en train de contempler, la narration démarre,
+  // comme pour n'importe quel autre tableau (sauf si l'action demandée la gère elle-même : guide, bouton voix).
   const ensureConsentFor = useCallback(
-    async (p: Painting): Promise<boolean> => {
+    async (p: Painting, opts: { narrate?: boolean } = {}): Promise<boolean> => {
       if (!p.nudity && !p.graphic) return true;
       if (nudityConsent === true) return true;
-      return await requestNudityConsent();
+      const accepted = await requestNudityConsent();
+      if (accepted && opts.narrate !== false) {
+        const cur = paintingsRef.current[activePaintingIdxRef.current];
+        if (cur && cur.id === p.id && tweaksRef.current.narration) {
+          stopNarration(setIsNarrating);
+          speakEdgeTTS(buildNarrationText(cur, langRef.current), cur, langRef.current, setIsNarrating);
+        }
+      }
+      return accepted;
     },
     [nudityConsent, requestNudityConsent]
   );
@@ -887,7 +900,7 @@ export default function App() {
   const handleToggleGuide = async () => {
     if (activePaintingIdx < 0) return;
     const currentP = paintings[activePaintingIdx];
-    const ok = await ensureConsentFor(currentP);
+    const ok = await ensureConsentFor(currentP, { narrate: false }); // le guide prend le relais de la voix
     if (!ok) return;
 
     if (isGuiding) {
@@ -912,7 +925,7 @@ export default function App() {
   const handleToggleNarration = async () => {
     if (activePaintingIdx < 0) return;
     const currentP = paintings[activePaintingIdx];
-    const ok = await ensureConsentFor(currentP);
+    const ok = await ensureConsentFor(currentP, { narrate: false }); // on lance la voix juste après
     if (!ok) return;
 
     if (isNarrating) {
@@ -1000,6 +1013,7 @@ export default function App() {
           isNarrating={isNarrating}
           isGuiding={isGuiding}
           isGuideLoading={isGuideLoading}
+          nudityConsent={nudityConsent}
           onToggleInfo={async () => {
             const ok = await ensureConsentFor(currentActivePainting);
             if (ok) setInfoOpen(prev => !prev);
