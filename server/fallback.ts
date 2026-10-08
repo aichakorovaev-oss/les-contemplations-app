@@ -50,6 +50,8 @@ export interface Verdict {
 }
 
 export function classify(err: any): Verdict {
+  // Une erreur peut imposer sa propre durée de pause (ex. moteur vocal injoignable)
+  if (typeof err?.cooldownMs === 'number') return { retry: true, cooldownMs: err.cooldownMs };
   const status = statusOf(err);
   const text = String(err?.message || err || '');
   if (status === 404) return { retry: true, cooldownMs: 10 * 60_000 }; // modèle retiré / inconnu
@@ -79,6 +81,8 @@ function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
 export interface FallbackOptions {
   /** délai maximal pour UN modèle (défaut 25 s) */
   attemptTimeoutMs?: number;
+  /** délai propre à chaque modèle (prioritaire sur attemptTimeoutMs) */
+  timeoutFor?: (model: string) => number | undefined;
   /** on n'ouvre plus de nouvel essai passé ce délai total (défaut 60 s) */
   budgetMs?: number;
   /** pour les logs */
@@ -102,7 +106,7 @@ export async function withFallback<T>(
     const model = order[i];
     if (i > 0 && Date.now() - start > budgetMs) break;
     try {
-      const result = await withTimeout(run(model), attemptTimeoutMs, model);
+      const result = await withTimeout(run(model), opts.timeoutFor?.(model) ?? attemptTimeoutMs, model);
       if (i > 0) console.warn(`[${label}] réponse obtenue avec le modèle de repli ${model}`);
       return result;
     } catch (err: any) {
