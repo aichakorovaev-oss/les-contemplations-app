@@ -1208,3 +1208,38 @@ body.annot-sheet-open #focus-caption, body.annot-sheet-open #focus-nav { opacity
 @keyframes eyeSpin { to { transform: rotate(360deg); } }
 .focus-tool.loading { opacity: .65; cursor: progress; }
 .focus-tool.loading svg { animation: eyeSpin 1s linear infinite; transform-origin: 50% 50%; }
+
+/* ── Règles des fenêtres de sécurité / feedback perdues au portage (reprises de l'original) ── */
+.safety-actions { flex-wrap: wrap; }
+.safety-link-action {
+  font-family: var(--sans); font-size: 12.5px; color: var(--ink-dim);
+  text-decoration: underline; text-underline-offset: 3px;
+  opacity: .8; transition: opacity .2s ease, color .2s ease; cursor: pointer;
+}
+.safety-link-action:hover { opacity: 1; color: var(--night-ink); }
+.fb-card .safety-title, .fb-card .safety-text { text-align: left; }
+.fb-error { font-family: var(--sans); font-size: 11px; color: #e8a; margin: -.6rem 0 1rem; }
+.fb-thanks { text-align: center; }
+.fb-thanks .safety-title, .fb-thanks .safety-text { text-align: center; }
+.fb-thanks svg { color: var(--amber); margin-bottom: .8rem; }
+
+/* Feedback : la liste de questions défile dans la fenêtre au lieu d'être écrasée */
+.fb-card { max-width: 480px; max-height: calc(100dvh - 32px); display: flex; flex-direction: column; }
+.fb-scroll { flex: 1 1 auto; min-height: 0; max-height: min(60vh, calc(100dvh - 270px)); -webkit-overflow-scrolling: touch; }
+.fb-card .fb-submit, .fb-card .safety-actions, .fb-card .fb-error { flex: none; }
+.fb-pill { min-height: 38px; }
+@media (max-width: 640px) {
+  #feedback-overlay, #report-overlay { padding: 12px; }
+  .fb-card.safety-card { padding: 1.5rem 1.2rem 1.2rem; border-radius: 1.4rem; }
+  .fb-card .safety-title { font-size: 19px; }
+  .fb-scroll { max-height: calc(100dvh - 250px); }
+}
+@media (max-height: 520px) and (orientation: landscape) {
+  .fb-card.safety-card { padding: 1rem 1.4rem; }
+  .fb-card .safety-title { font-size: 17px; margin-bottom: .3rem; }
+  .fb-card .safety-text { margin-bottom: .6rem; font-size: 12px; }
+  .fb-scroll { max-height: calc(100dvh - 235px); margin-bottom: .6rem; }
+  .fb-card .fb-submit { padding: 10px; margin-top: 0; }
+  .fb-card .safety-actions { margin-top: .4rem !important; }
+  .fb-stars { margin-bottom: .8rem; }
+}
