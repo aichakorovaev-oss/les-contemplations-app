@@ -1,655 +1,143 @@
-/**
- * Enregistrement des retours visiteurs (feedback) et signalements d'œuvres dans un dataset Hugging Face.
- *
- * RÈGLE : ne JAMAIS créer de nouveau fichier dans le dataset. Les lignes sont AJOUTÉES aux fichiers qui
- * existent déjà (ceux de l'ancienne version), en respectant leur format (.jsonl, .json ou .csv) et leurs
- * colonnes. Ces fichiers sont retrouvés par leur nom, ou indiqués explicitement :
- *     HF_FEEDBACK_FILE   chemin exact du fichier des feedbacks dans le dataset (ex. « feedback.jsonl »)
- *     HF_REPORT_FILE     chemin exact du fichier des signalements          (ex. « reports.jsonl »)
- * S'il n'y a aucun fichier sûr (introuvable, ou plusieurs candidats), RIEN n'est écrit sur Hugging Face :
- * le retour est gardé dans un fichier local éphémère et un avertissement détaillé est affiché dans les logs.
- * (HF_ALLOW_CREATE=1 autorise explicitement la création d'un fichier dont le nom est configuré.)
- *
- * Écriture sûre : file d'attente (les envois simultanés sont regroupés) + commit rattaché à la version
- * lue (`parentCommit`) ; si quelqu'un d'autre a modifié le dataset entre-temps, on relit et on réessaie.
- *
- * Variables d'environnement : HF_TOKEN (droit d'écriture) et HF_DATASET (« utilisateur/nom » ou URL).
- */
-import fs from 'fs';
-import path from 'path';
-import { randomUUID } from 'crypto';
+// `npx tsx tests/storage.test.ts`
+import assert from 'node:assert/strict';
+import {
+  PyFloat, alignRecord, appendRecords, buildCommitBody, buildRecord, csvCell, describeConfig, fileOverrides, fmtOf, inspectTable,
+  isoSeconds, normalizeRepo, parseCsv, pickTargets, pyJson, readHfConfig, sanitizeFeedback, sanitizeReport,
+} from '../server/storage.ts';
 
-export type Kind = 'feedback' | 'reports';
+const env = (o: Record<string, string>) => o as NodeJS.ProcessEnv;
 
-// ─────────────────────────────────────────────────────────────
-// Validation / nettoyage des charges envoyées par le navigateur
-// ─────────────────────────────────────────────────────────────
-const str = (v: unknown, max: number) => (typeof v === 'string' ? v.replace(/\u0000/g, '').trim().slice(0, max) : '');
-const bool = (v: unknown): boolean | null => (typeof v === 'boolean' ? v : null);
-const list = (v: unknown, n: number, m: number): string[] =>
-  Array.isArray(v) ? v.map(x => str(x, m)).filter(Boolean).slice(0, n) : [];
-const intIn = (v: unknown, lo: number, hi: number): number | null =>
-  typeof v === 'number' && Number.isInteger(v) && v >= lo && v <= hi ? v : null;
+// ── nom du dataset / variables ──
+assert.equal(normalizeRepo('https://huggingface.co/datasets/aicha/ds/tree/main'), 'aicha/ds');
+assert.equal(normalizeRepo('datasets/aicha/ds/'), 'aicha/ds');
+let c = readHfConfig(env({ HUGGINGFACE_TOKEN: 'hf_y', DATASET_ID: 'a/b' }))!;
+assert.deepEqual([c.tokenVar, c.repoVar, c.repo], ['HUGGINGFACE_TOKEN', 'DATASET_ID', 'a/b']);
+assert.equal(readHfConfig(env({ HF_TOKEN: 'x' })), null);
+assert.ok(!JSON.stringify(describeConfig(env({ HF_TOKEN: 'hf_SECRET', HF_DATASET: 'a/b' }))).includes('hf_SECRET'));
+assert.deepEqual(fileOverrides(env({ HF_FEEDBACK_FILE: '/feedback.jsonl', REPORTS_FILE: 'r.csv' })), { feedback: 'feedback.jsonl', reports: 'r.csv' });
 
-export function sanitizeFeedback(b: any) {
-  const rec = {
-    rating: intIn(b?.rating, 1, 5),
-    empty_frame_seen: bool(b?.empty_frame_seen),
-    resonated: bool(b?.resonated),
-    surprised: bool(b?.surprised),
-    would_recommend: bool(b?.would_recommend),
-    why_not: str(b?.why_not, 1000),
-    comment: str(b?.comment, 2000),
-    mood_tags: list(b?.mood_tags, 12, 40),
-    painting_count: intIn(b?.painting_count, 0, 500),
-    lang: b?.lang === 'en' ? 'en' : 'fr',
-    nonce: str(b?.nonce, 64),
-  };
-  const hasAnswer =
-    rec.rating !== null ||
-    rec.empty_frame_seen !== null ||
-    rec.resonated !== null ||
-    rec.surprised !== null ||
-    rec.would_recommend !== null ||
-    !!rec.comment ||
-    !!rec.why_not;
-  return hasAnswer ? rec : null;
-}
+// ── nettoyage des charges ──
+const fb = sanitizeFeedback({ rating: 4, resonated: true, comment: ' Superbe\u0000 ', mood_tags: ['calme', 5, ''], lang: 'en', hack: 1 })!;
+assert.equal(fb.comment, 'Superbe'); assert.equal(fb.lang, 'en'); assert.ok(!('hack' in fb));
+assert.equal(sanitizeFeedback({}), null);
+assert.equal(sanitizeReport({ painting_id: 'venus' }), null);
+assert.equal(sanitizeReport({ painting_id: 'venus', reason_category: 'x' })!.painting_id, 'venus');
 
-export function sanitizeReport(b: any) {
-  const rec = {
-    painting_id: str(b?.painting_id, 80) || null,
-    painting_title: str(b?.painting_title, 200) || null,
-    reason_category: str(b?.reason_category, 60),
-    reason_text: str(b?.reason_text, 1000),
-    mood_tags: list(b?.mood_tags, 12, 40),
-    lang: b?.lang === 'en' ? 'en' : 'fr',
-    nonce: str(b?.nonce, 64),
-  };
-  return rec.reason_category ? rec : null;
-}
+// ── CHOIX DU FICHIER : on ne crée jamais, on retrouve l'existant ──
+const old = ['README.md', '.gitattributes', 'feedback.jsonl', 'reports.jsonl'];
+let t = pickTargets(old);
+assert.equal(t.feedback.path, 'feedback.jsonl'); assert.equal(t.reports.path, 'reports.jsonl');
+t = pickTargets(['data/feedbacks.csv', 'data/report_log.json', 'README.md']);
+assert.equal(t.feedback.path, 'data/feedbacks.csv'); assert.equal(t.reports.path, 'data/report_log.json');
+// restes de la version « un fichier par retour » : jamais pris pour cible
+t = pickTargets(['feedback.jsonl', 'reports.jsonl', 'feedback/2026-10-09/20261009T101530Z-ab12cd.jsonl', 'reports/2026-10-09/x.jsonl']);
+assert.equal(t.feedback.path, 'feedback.jsonl'); assert.equal(t.reports.path, 'reports.jsonl');
+// aucun fichier → pas de cible (donc rien n'est créé)
+t = pickTargets(['README.md']);
+assert.equal(t.feedback.path, undefined); assert.match(t.feedback.problem!, /HF_FEEDBACK_FILE/);
+// ambigu → pas de cible…
+t = pickTargets(['feedback_2025.jsonl', 'feedback_2026.jsonl']);
+assert.equal(t.feedback.path, undefined); assert.match(t.feedback.problem!, /plusieurs/);
+// … sauf un nom exact
+t = pickTargets(['feedback.jsonl', 'feedback_old.jsonl']);
+assert.equal(t.feedback.path, 'feedback.jsonl');
+// fichier imposé : doit exister (sinon pas de création)…
+t = pickTargets(['feedback.jsonl'], { feedback: 'autre.jsonl' });
+assert.equal(t.feedback.path, undefined); assert.match(t.feedback.problem!, /n'existe pas/);
+// … sauf autorisation explicite
+t = pickTargets(['feedback.jsonl'], { feedback: 'autre.jsonl' }, true);
+assert.equal(t.feedback.path, 'autre.jsonl'); assert.equal(t.feedback.create, true);
+assert.equal(pickTargets(['x'], { feedback: 'a.parquet' }).feedback.path, undefined);
+assert.equal(fmtOf('a/b.JSONL'), 'jsonl'); assert.equal(fmtOf('x.parquet'), null);
 
-// ─────────────────────────────────────────────────────────────
-// Configuration (tolérante sur les noms de variables)
-// ─────────────────────────────────────────────────────────────
-const TOKEN_KEYS = ['HF_TOKEN', 'HUGGINGFACE_TOKEN', 'HUGGING_FACE_HUB_TOKEN', 'HF_API_TOKEN', 'HF_WRITE_TOKEN', 'HUGGINGFACE_API_TOKEN'];
-const DATASET_KEYS = [
-  'HF_DATASET', 'HF_DATASET_REPO', 'HF_DATASET_ID', 'HF_DATASET_NAME', 'HF_REPO', 'HF_REPO_ID',
-  'DATASET', 'DATASET_REPO', 'DATASET_ID', 'DATASET_NAME', 'FEEDBACK_DATASET', 'HF_FEEDBACK_DATASET',
+// ── Format EXACT de l'ancienne version (lignes réelles relevées dans le dataset) ──
+const OLD_FB = [
+  '{"id": "ea6af0d8-d627-4def-b910-febf4f77c7e6", "ts": 1790576772.6201935, "type": "app_feedback", "rating": 5, "empty_frame_seen": false, "resonated": true, "surprised": true, "would_recommend": true, "why_not": "", "comment": "Test", "mood_tags": ["tired"], "painting_count": 10, "lang": "en", "nonce": "a64e3d46-f6d4-4101-b7c4-603798da5f80"}',
+  '{"id": "321a56f7-c744-4841-8aca-c16b005c5875", "ts": 1790834519.9310412, "date": "2026-10-01T06:01:59+00:00", "type": "app_feedback", "rating": 5, "empty_frame_seen": false, "resonated": true, "surprised": false, "would_recommend": true, "why_not": "", "comment": "Test iPhone", "mood_tags": ["apaisé", "curieux"], "painting_count": 10, "lang": "fr", "nonce": "c209405c-8a2d-4c6f-8bf6-94c6e83f997b"}',
 ];
+const OLD_RP = [
+  '{"id": "3d1401bc-1ce3-4210-9f6f-82286a0f42fb", "ts": 1790576662.0407686, "type": "report", "painting_id": "starry_night", "painting_title": "The Starry Night", "reason_category": "triggering", "reason_text": "Test", "mood_tags": ["tired"], "lang": "en", "nonce": "a64e3d46-f6d4-4101-b7c4-603798da5f80"}',
+  '{"id": "d2121e2d-8296-4bd8-91f4-07745fa18f59", "ts": 1790834757.587602, "date": "2026-10-01T06:05:57+00:00", "type": "report", "painting_id": "kiss", "painting_title": "Le Baiser", "reason_category": "triggering", "reason_text": "Test iPhone", "mood_tags": ["apaisé", "curieux"], "lang": "fr", "nonce": "d2121e2d-8296-4bd8-91f4-07745fa18f59"}',
+];
+// « squelette » d'une ligne : toutes les valeurs remplacées, la ponctuation et l'ordre des clés restent
+const skeleton = (line: string) => line.replace(/"(?:[^"\\]|\\.)*"(?=:)/g, 'K').replace(/"(?:[^"\\]|\\.)*"/g, 'S').replace(/-?\d+\.\d+/g, 'F').replace(/-?\d+/g, 'N').replace(/\b(true|false|null)\b/g, 'V');
+const at = new Date('2026-10-09T22:30:43.886Z');
 
-export interface HfConfig {
-  token: string;
-  tokenVar: string;
-  repo: string; // « owner/name » ou « name » seul
-  repoVar: string;
-  endpoint: string;
-}
+assert.equal(pyJson({ a: 1, b: ['é', 'x'], c: null, d: true, e: [] , f: new PyFloat(5) }), '{"a": 1, "b": ["é", "x"], "c": null, "d": true, "e": [], "f": 5.0}');
+assert.equal(isoSeconds(at), '2026-10-09T22:30:43+00:00');
+assert.equal(new PyFloat(1790576772.6201935).toString(), '1790576772.6201935');
+// round-trip : nos lignes relues puis réécrites à la Python restent identiques au caractère près
+for (const l of [...OLD_FB, ...OLD_RP]) assert.equal(pyJson(JSON.parse(l)).replace(/(\d{10})(?=[,}])/g, '$1'), pyJson(JSON.parse(l)));
 
-/** Accepte « owner/name », « datasets/owner/name » ou l'URL complète du dataset. */
-export function normalizeRepo(raw: string): string {
-  let v = raw.trim().replace(/^https?:\/\/[^/]+\//i, '').replace(/^datasets\//i, '');
-  v = v.replace(/[?#].*$/, '').replace(/\/+$/, '').replace(/\/(tree|blob|resolve)\/.*$/i, '');
-  return v;
-}
+const fbData = sanitizeFeedback({ rating: 5, empty_frame_seen: false, resonated: true, surprised: false, would_recommend: true, comment: 'Nouveau', mood_tags: ['apaisé', 'curieux'], painting_count: 10, lang: 'fr', nonce: 'c209405c-8a2d-4c6f-8bf6-94c6e83f997b' })!;
+const fbRec = buildRecord('feedback', fbData, at);
+assert.deepEqual(Object.keys(fbRec), Object.keys(JSON.parse(OLD_FB[1])));              // mêmes clés, même ordre que l'ancienne version
+const existingFb = OLD_FB.join('\n') + '\n';
+const outFb = appendRecords('jsonl', existingFb, [fbRec], at);
+assert.ok(outFb.startsWith(existingFb));                                                // l'existant est intact
+const newFb = outFb.slice(existingFb.length).trimEnd();
+assert.equal(skeleton(newFb), skeleton(OLD_FB[1]));                                     // même forme que la dernière ligne ancienne
+assert.match(newFb, /^\{"id": "[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}", "ts": 1791585043\.886, "date": "2026-10-09T22:30:43\+00:00", "type": "app_feedback", "rating": 5, /);
+assert.ok(newFb.includes('"mood_tags": ["apaisé", "curieux"]'));                       // accents non échappés, séparateurs à la Python
 
-export function readHfConfig(env: NodeJS.ProcessEnv = process.env): HfConfig | null {
-  const pick = (keys: string[], re: RegExp) => {
-    for (const k of keys) if (env[k]?.trim()) return { k, v: env[k]!.trim() };
-    for (const k of Object.keys(env)) if (re.test(k) && env[k]?.trim()) return { k, v: env[k]!.trim() };
-    return null;
-  };
-  const tok = pick(TOKEN_KEYS, /^HF_.*TOKEN$/i);
-  const ds = pick(DATASET_KEYS, /DATASET/i);
-  if (!tok || !ds) return null;
-  const repo = normalizeRepo(ds.v);
-  if (!repo) return null;
-  return {
-    token: tok.v,
-    tokenVar: tok.k,
-    repo,
-    repoVar: ds.k,
-    endpoint: (env.HF_ENDPOINT || 'https://huggingface.co').replace(/\/+$/, ''),
-  };
-}
+const rpData = sanitizeReport({ painting_id: 'kiss', painting_title: 'Le Baiser', reason_category: 'triggering', reason_text: 'Nouveau', mood_tags: ['apaisé', 'curieux'], lang: 'fr', nonce: 'x' })!;
+const rpRec = buildRecord('reports', rpData, at);
+assert.deepEqual(Object.keys(rpRec), Object.keys(JSON.parse(OLD_RP[1])));
+const existingRp = OLD_RP.join('\n') + '\n';
+const newRp = appendRecords('jsonl', existingRp, [rpRec], at).slice(existingRp.length).trimEnd();
+assert.equal(skeleton(newRp), skeleton(OLD_RP[1]));
+assert.match(newRp, /"type": "report", "painting_id": "kiss"/);
 
-/** Ce que le serveur détecte, sans jamais révéler le jeton (pour le diagnostic). */
-export function describeConfig(env: NodeJS.ProcessEnv = process.env) {
-  const cfg = readHfConfig(env);
-  const tokenKeys = Object.keys(env).filter(k => TOKEN_KEYS.includes(k) || /^HF_.*TOKEN$/i.test(k));
-  const datasetKeys = Object.keys(env).filter(k => DATASET_KEYS.includes(k) || /DATASET/i.test(k));
-  return {
-    configured: !!cfg,
-    backend: cfg ? 'huggingface' : 'local-file',
-    token_variable: cfg?.tokenVar ?? null,
-    dataset_variable: cfg?.repoVar ?? null,
-    dataset: cfg?.repo ?? null,
-    token_variables_found: tokenKeys,
-    dataset_variables_found: datasetKeys,
-  };
-}
+// ts entier en millisecondes pile : toujours écrit avec une décimale (float Python)
+assert.match(pyJson(buildRecord('feedback', fbData, new Date('2026-10-09T22:30:43.000Z'))), /"ts": 1791585043\.0,/);
+// liste vide, valeurs absentes
+const bare = buildRecord('feedback', sanitizeFeedback({ rating: 3 })!, at);
+assert.match(pyJson(bare), /"empty_frame_seen": null, .*"why_not": "", "comment": "", "mood_tags": \[\], "painting_count": null, "lang": "fr", "nonce": ""\}$/);
+// dernière ligne sans retour à la ligne + plusieurs lignes d'un coup + fichier vide
+assert.equal(appendRecords('jsonl', OLD_FB.join('\n'), [fbRec], at).trimEnd().split('\n').length, 3);
+assert.equal(appendRecords('jsonl', existingFb, [fbRec, fbRec, fbRec], at).trim().split('\n').length, 5);
+assert.equal(appendRecords('jsonl', '', [fbRec], at).split('\n').length, 2);
+// des enregistrements différents ont des identifiants différents
+assert.notEqual(buildRecord('feedback', fbData).id, buildRecord('feedback', fbData).id);
 
-// ─────────────────────────────────────────────────────────────
-// Hugging Face Hub
-// ─────────────────────────────────────────────────────────────
-async function hf(cfg: HfConfig, url: string, init: RequestInit = {}, timeoutMs = 15_000): Promise<Response> {
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
-  try {
-    return await fetch(url, {
-      ...init,
-      headers: { Authorization: `Bearer ${cfg.token}`, ...(init.headers || {}) },
-      signal: ctrl.signal,
-    });
-  } finally {
-    clearTimeout(timer);
-  }
-}
+// données pour les formats CSV / JSON (autres jeux de données que le vôtre)
+const rec = { id: 'abc', kind: 'feedback', created_at: '2026-10-09T10:15:30.000Z', rating: 4, comment: 'nouveau', would_recommend: true, lang: 'fr', mood_tags: ['calme'] };
+const now = new Date('2026-10-09T10:15:30.000Z');
+let out: string;
 
-const ownerCache = new Map<string, string>();
-/** « owner/name » complet ; si seul le nom est fourni, le propriétaire vient du jeton (whoami). */
-export async function resolveRepo(cfg: HfConfig): Promise<string> {
-  if (cfg.repo.includes('/')) return cfg.repo;
-  const cached = ownerCache.get(cfg.token);
-  if (cached) return `${cached}/${cfg.repo}`;
-  const res = await hf(cfg, `${cfg.endpoint}/api/whoami-v2`);
-  if (!res.ok) throw new Error(`jeton refusé par Hugging Face (whoami ${res.status})`);
-  const me: any = await res.json();
-  if (!me?.name) throw new Error('whoami: nom d\'utilisateur introuvable');
-  ownerCache.set(cfg.token, me.name);
-  return `${me.name}/${cfg.repo}`;
-}
+// ── CSV : en-tête respecté, guillemets / virgules / retours à la ligne protégés, style des booléens imité ──
+const oldCsv = 'timestamp,rating,comment,would_recommend\n2026-09-01 10:00:00,5,"super, vraiment",True\n2026-09-02 10:00:00,3,bof,False\n';
+out = appendRecords('csv', oldCsv, [{ ...rec, comment: 'Il a dit "génial",\nmerci' }], now);
+assert.ok(out.startsWith(oldCsv));
+const rows = parseCsv(out);
+assert.equal(rows.length, 4);
+assert.deepEqual(rows[3], ['2026-10-09 10:15:30', '4', 'Il a dit "génial",\nmerci', 'True']);   // « True » comme avant, date au même format
+// listes : style Python ['a', 'b'] imité si le fichier existant l'utilise
+const oldPy = 'timestamp,rating,mood_tags\n2026-09-01 10:00:00,5,"[\'calme\']"\n';
+assert.deepEqual(parseCsv(appendRecords('csv', oldPy, [{ ...rec, mood_tags: ['calme', 'joyeux'] }], now))[2], ['2026-10-09 10:15:30', '4', "['calme', 'joyeux']"]);
+assert.deepEqual(parseCsv(appendRecords('csv', 'timestamp,rating,mood_tags\n2026-09-01 10:00:00,5,"[]"\n', [{ ...rec, mood_tags: ['a'] }], now))[2][2], '["a"]');
+assert.equal(csvCell('a,b'), '"a,b"'); assert.equal(csvCell('simple'), 'simple');
+assert.deepEqual(parseCsv('\uFEFFa,b\r\n1,2\r\n')[0][1], 'b');
+out = appendRecords('csv', oldCsv.replace(/\n/g, '\r\n'), [rec], now);
+assert.ok(out.includes('\r\n') && !/[^\r]\n/.test(out));                                          // fins de ligne conservées
+// colonnes manquantes → cellule vide ; alias de colonnes
+out = appendRecords('csv', 'date,stars,text,extra\n', [rec], now);
+const r2 = parseCsv(out);
+assert.deepEqual(r2[1], ['2026-10-09T10:15:30.000Z', '4', 'nouveau', '']);
 
+// ── JSON (liste) ──
+const oldJson = '[\n  {"timestamp": "2026-09-01", "reason_category": "x"}\n]\n';
+out = appendRecords('json', oldJson, [{ id: 'z', kind: 'reports', created_at: 'n', reason_category: 'inappropriate', painting_id: 'venus' }], now);
+const arr = JSON.parse(out); assert.equal(arr.length, 2); assert.deepEqual(Object.keys(arr[1]), ['timestamp', 'reason_category']);
+assert.throws(() => inspectTable('json', '{"a":1}'));
 
-// ─────────────────────────────────────────────────────────────
-// Format EXACT des enregistrements de l'ancienne version (relevé sur les fichiers du dataset)
-//
-//   feedback (type « app_feedback ») :
-//     id, ts, date, type, rating, empty_frame_seen, resonated, surprised, would_recommend,
-//     why_not, comment, mood_tags, painting_count, lang, nonce
-//   report (type « report ») :
-//     id, ts, date, type, painting_id, painting_title, reason_category, reason_text,
-//     mood_tags, lang, nonce
-//
-//   id    : UUID v4                          ts : secondes Unix en nombre à virgule (1790834519.93)
-//   date  : ISO UTC à la seconde « +00:00 » (2026-10-01T06:01:59+00:00)
-//   JSON  : séparateurs Python « , » et « : », accents non échappés, une ligne par enregistrement
-// ─────────────────────────────────────────────────────────────
-/** Nombre à virgule : s'écrit toujours avec une décimale (1791585043.0), comme le float de Python. */
-export class PyFloat {
-  constructor(public value: number) {}
-  toJSON() { return this.value; }
-  toString() { return Number.isInteger(this.value) ? this.value.toFixed(1) : String(this.value); }
-}
+// ── alignement direct ──
+const tbl = inspectTable('jsonl', '{"when":"x","stars":1,"unknown":"u"}\n')!;
+assert.deepEqual(alignRecord({ rating: 5 }, tbl, now), { when: null, stars: 5, unknown: null });   // « when » n'est pas un nom d'horodatage connu
 
-/** json.dumps(obj, ensure_ascii=False) de Python : « {"a": 1, "b": [1, 2]} ». */
-export function pyJson(v: any): string {
-  if (v instanceof PyFloat) return v.toString();
-  if (v === null || v === undefined) return 'null';
-  if (Array.isArray(v)) return '[' + v.map(pyJson).join(', ') + ']';
-  if (typeof v === 'object') return '{' + Object.entries(v).filter(([, x]) => x !== undefined).map(([k, x]) => `${JSON.stringify(k)}: ${pyJson(x)}`).join(', ') + '}';
-  return JSON.stringify(v);
-}
-
-/** « 2026-10-01T06:01:59+00:00 » (datetime.isoformat(timespec="seconds") en UTC). */
-export function isoSeconds(d: Date): string {
-  return d.toISOString().slice(0, 19) + '+00:00';
-}
-
-const TYPE_OF: Record<Kind, string> = { feedback: 'app_feedback', reports: 'report' };
-
-/** Enregistrement complet, clés dans l'ordre de l'ancienne version. `data` vient de sanitizeFeedback/Report. */
-export function buildRecord(kind: Kind, data: Record<string, any>, now = new Date()): Record<string, any> {
-  const head = { id: randomUUID(), ts: new PyFloat(now.getTime() / 1000), date: isoSeconds(now), type: TYPE_OF[kind] };
-  if (kind === 'feedback') {
-    return { ...head, rating: data.rating ?? null, empty_frame_seen: data.empty_frame_seen ?? null, resonated: data.resonated ?? null,
-      surprised: data.surprised ?? null, would_recommend: data.would_recommend ?? null, why_not: data.why_not ?? '', comment: data.comment ?? '',
-      mood_tags: data.mood_tags ?? [], painting_count: data.painting_count ?? null, lang: data.lang ?? 'fr', nonce: data.nonce ?? '' };
-  }
-  return { ...head, painting_id: data.painting_id ?? null, painting_title: data.painting_title ?? null, reason_category: data.reason_category ?? '',
-    reason_text: data.reason_text ?? '', mood_tags: data.mood_tags ?? [], lang: data.lang ?? 'fr', nonce: data.nonce ?? '' };
-}
-
-// ─────────────────────────────────────────────────────────────
-// Fichiers cibles : jamais de création, on retrouve les fichiers existants
-// ─────────────────────────────────────────────────────────────
-export type Fmt = 'jsonl' | 'json' | 'csv';
-export function fmtOf(p: string): Fmt | null {
-  const ext = p.toLowerCase().split('.').pop();
-  return ext === 'jsonl' ? 'jsonl' : ext === 'json' ? 'json' : ext === 'csv' ? 'csv' : null;
-}
-
-const FILE_ENV: Record<Kind, string[]> = {
-  feedback: ['HF_FEEDBACK_FILE', 'HF_FEEDBACK_PATH', 'FEEDBACK_FILE', 'FEEDBACKS_FILE'],
-  reports: ['HF_REPORT_FILE', 'HF_REPORTS_FILE', 'HF_REPORT_PATH', 'REPORT_FILE', 'REPORTS_FILE'],
-};
-export function fileOverrides(env: NodeJS.ProcessEnv = process.env): Partial<Record<Kind, string>> {
-  const out: Partial<Record<Kind, string>> = {};
-  for (const kind of ['feedback', 'reports'] as Kind[]) {
-    for (const k of FILE_ENV[kind]) if (env[k]?.trim()) { out[kind] = env[k]!.trim().replace(/^\/+/, ''); break; }
-  }
-  return out;
-}
-
-export interface Target {
-  /** chemin du fichier à compléter ; absent si aucun choix sûr */
-  path?: string;
-  /** vrai si le fichier n'existe pas encore (création explicitement autorisée) */
-  create?: boolean;
-  /** pourquoi aucun fichier n'a été retenu */
-  problem?: string;
-  candidates: string[];
-}
-
-// Fichiers de la version « un fichier par retour » (feedback/AAAA-MM-JJ/…) : jamais pris pour cible
-const LEGACY_PER_RECORD = /^(feedback|reports)\/\d{4}-\d{2}-\d{2}\//;
-const NAME_RE: Record<Kind, RegExp> = { feedback: /feedback|avis/i, reports: /report|signal/i };
-const EXACT_RE: Record<Kind, RegExp> = { feedback: /^(feedbacks?|avis)$/i, reports: /^(reports?|signalements?)$/i };
-const base = (p: string) => p.split('/').pop() || p;
-const stem = (p: string) => base(p).replace(/\.[^.]+$/, '');
-
-export function pickTargets(
-  files: string[],
-  overrides: Partial<Record<Kind, string>> = {},
-  allowCreate = false
-): Record<Kind, Target> {
-  const set = new Set(files);
-  const out = {} as Record<Kind, Target>;
-  for (const kind of ['feedback', 'reports'] as Kind[]) {
-    const supported = files.filter(f => fmtOf(f) && !LEGACY_PER_RECORD.test(f));
-    const candidates = supported.filter(f => NAME_RE[kind].test(base(f)));
-    const o = overrides[kind];
-    if (o) {
-      if (!fmtOf(o)) out[kind] = { candidates, problem: `format de « ${o} » non géré (attendu .jsonl, .json ou .csv)` };
-      else if (set.has(o)) out[kind] = { path: o, candidates };
-      else if (allowCreate) out[kind] = { path: o, create: true, candidates };
-      else out[kind] = { candidates, problem: `le fichier « ${o} » n'existe pas dans le dataset (création non autorisée)` };
-      continue;
-    }
-    if (candidates.length === 1) { out[kind] = { path: candidates[0], candidates }; continue; }
-    const exact = candidates.filter(f => EXACT_RE[kind].test(stem(f)));
-    if (candidates.length > 1 && exact.length === 1) { out[kind] = { path: exact[0], candidates }; continue; }
-    out[kind] = {
-      candidates,
-      problem: candidates.length === 0
-        ? 'aucun fichier existant ne ressemble à ce nom (feedback / report) : indiquez-le avec ' + FILE_ENV[kind][0]
-        : `plusieurs fichiers possibles (${candidates.join(', ')}) : indiquez le bon avec ${FILE_ENV[kind][0]}`,
-    };
-  }
-  return out;
-}
-
-// ─────────────────────────────────────────────────────────────
-// Lecture / ajout de lignes en respectant le format et les colonnes existants
-// ─────────────────────────────────────────────────────────────
-export function parseCsv(text: string): string[][] {
-  const rows: string[][] = [];
-  let row: string[] = [];
-  let cell = '';
-  let quoted = false;
-  for (let i = 0; i < text.length; i++) {
-    const c = text[i];
-    if (quoted) {
-      if (c === '"') { if (text[i + 1] === '"') { cell += '"'; i++; } else quoted = false; }
-      else cell += c;
-    } else if (c === '"') quoted = true;
-    else if (c === ',') { row.push(cell); cell = ''; }
-    else if (c === '\n' || c === '\r') {
-      if (c === '\r' && text[i + 1] === '\n') i++;
-      row.push(cell); rows.push(row); row = []; cell = '';
-    } else cell += c;
-  }
-  if (cell !== '' || row.length) { row.push(cell); rows.push(row); }
-  return rows.filter(r => !(r.length === 1 && r[0] === ''));
-}
-export const csvCell = (v: string) => (/[",\r\n]/.test(v) || /^\s|\s$/.test(v) ? `"${v.replace(/"/g, '""')}"` : v);
-
-export interface Table {
-  fmt: Fmt;
-  keys: string[];
-  sample: Record<string, any>;
-  rows: number;
-  /** colonne → valeurs lues (CSV) pour imiter le style (booléens, listes) */
-  csvBody?: string[][];
-}
-
-/** Lit un fichier existant : colonnes, nombre de lignes, dernière ligne (pour imiter le style). */
-export function inspectTable(fmt: Fmt, text: string): Table | null {
-  const body = text.replace(/^\uFEFF/, '');
-  if (!body.trim()) return null;
-  if (fmt === 'csv') {
-    const rows = parseCsv(body);
-    if (!rows.length) return null;
-    const keys = rows[0];
-    const data = rows.slice(1);
-    const last = data[data.length - 1] || [];
-    return { fmt, keys, sample: Object.fromEntries(keys.map((k, i) => [k, last[i]])), rows: data.length, csvBody: data };
-  }
-  let rows: any[];
-  if (fmt === 'jsonl') {
-    rows = body.split('\n').map(l => l.trim()).filter(Boolean).map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(r => r && typeof r === 'object');
-  } else {
-    const parsed = JSON.parse(body);
-    if (!Array.isArray(parsed)) throw new Error('fichier .json qui n\'est pas une liste : format non géré');
-    rows = parsed.filter(r => r && typeof r === 'object');
-  }
-  const keys: string[] = [];
-  for (const r of rows.slice(-30)) for (const k of Object.keys(r)) if (!keys.includes(k)) keys.push(k);
-  return { fmt, keys, sample: rows[rows.length - 1] || {}, rows: rows.length };
-}
-
-const TS_KEYS = ['created_at', 'timestamp', 'ts', 'time', 'date', 'datetime', 'created', 'created_on', 'submitted_at', 'createdat'];
-const ALIASES: Record<string, string[]> = {
-  rating: ['stars', 'score', 'note'],
-  would_recommend: ['recommend', 'recommended', 'wouldrecommend'],
-  comment: ['comments', 'message', 'text', 'free_text'],
-  why_not: ['why_not_recommend', 'whynot'],
-  mood_tags: ['moods', 'tags', 'mood', 'moodtags'],
-  empty_frame_seen: ['empty_frame', 'emptyframe'],
-  painting_id: ['painting', 'work_id', 'paintingid'],
-  painting_title: ['title', 'painting_name', 'paintingtitle'],
-  reason_category: ['category', 'reason', 'motif', 'reasoncategory'],
-  reason_text: ['details', 'description', 'text', 'reasontext'],
-  lang: ['language', 'locale'],
-};
-
-function formatTimestamp(sample: unknown, now: Date): string | number {
-  if (typeof sample === 'number') return sample > 1e12 ? now.getTime() : Math.floor(now.getTime() / 1000);
-  if (typeof sample === 'string') {
-    if (/^\d{12,13}$/.test(sample)) return String(now.getTime());
-    if (/^\d{9,11}(\.\d+)?$/.test(sample)) return String(Math.floor(now.getTime() / 1000));
-    if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}/.test(sample)) return now.toISOString().slice(0, 19).replace('T', ' ');
-  }
-  return now.toISOString();
-}
-
-/** Une ligne dans les colonnes EXISTANTES (valeur absente → null) ; colonnes inconnues ignorées. */
-export function alignRecord(rec: Record<string, any>, table: Table, now = new Date()): Record<string, any> {
-  const out: Record<string, any> = {};
-  for (const key of table.keys) {
-    const lk = key.toLowerCase();
-    if (key in rec) out[key] = rec[key];
-    else if (TS_KEYS.includes(lk)) out[key] = formatTimestamp(table.sample[key], now);
-    else {
-      let v: any = null;
-      for (const [mine, alts] of Object.entries(ALIASES)) if (mine in rec && alts.includes(lk)) { v = rec[mine]; break; }
-      out[key] = v;
-    }
-  }
-  return out;
-}
-
-function csvValue(v: any, sampleCell: string | undefined, boolStyle: 'py' | 'lower' | 'num', listStyle: 'json' | 'py' = 'json'): string {
-  if (v === null || v === undefined) return '';
-  if (typeof v === 'boolean') return boolStyle === 'py' ? (v ? 'True' : 'False') : boolStyle === 'num' ? (v ? '1' : '0') : v ? 'true' : 'false';
-  if (Array.isArray(v)) {
-    if (sampleCell !== undefined && sampleCell !== '' && !sampleCell.trim().startsWith('[')) return v.join(', '); // liste « a, b »
-    return listStyle === 'py' ? `[${v.map(x => `'${String(x).replace(/'/g, "\\'")}'`).join(', ')}]` : JSON.stringify(v);
-  }
-  if (typeof v === 'object') return JSON.stringify(v);
-  return String(v);
-}
-/** Listes écrites à la Python (['a', 'b']) ou en JSON (["a", "b"]) dans le fichier existant ? */
-function csvListStyle(body: string[][] | undefined): 'json' | 'py' {
-  return (body || []).flat().some(c => /^\[\s*'/.test(c)) ? 'py' : 'json';
-}
-function csvBoolStyle(body: string[][] | undefined): 'py' | 'lower' | 'num' {
-  const cells = (body || []).flat();
-  if (cells.some(c => c === 'True' || c === 'False')) return 'py';
-  if (cells.some(c => c === 'true' || c === 'false')) return 'lower';
-  return 'lower';
-}
-
-/** Contenu complet du fichier après ajout des lignes (le contenu existant est conservé tel quel). */
-export function appendRecords(fmt: Fmt, existing: string, records: Record<string, any>[], now = new Date()): string {
-  const table = inspectTable(fmt, existing);
-  const rows = table ? records.map(r => alignRecord(r, table, now)) : records;
-  const keys = table ? table.keys : Object.keys(records[0] || {});
-
-  if (fmt === 'jsonl') {
-    // Les lignes suivent le format de l'ancienne version (voir buildRecord) : on ne copie PAS le style de la
-    // dernière ligne du fichier (qui pourrait elle-même être mal formée). Une colonne présente dans le
-    // fichier mais inconnue ici est ajoutée en fin de ligne avec la valeur null.
-    const extra = table ? table.keys : [];
-    const lines = records.map(r => {
-      const row: Record<string, any> = { ...r };
-      for (const k of extra) if (!(k in row)) row[k] = null;
-      return pyJson(row);
-    });
-    const text = existing.endsWith('\n') || !existing ? existing : existing + '\n';
-    return text + lines.join('\n') + '\n';
-  }
-  if (fmt === 'json') {
-    const arr: any[] = table ? JSON.parse(existing.replace(/^\uFEFF/, '')) : [];
-    arr.push(...rows);
-    const indent = /\n\s{4}"/.test(existing) ? 4 : /\n\s{2}["{]/.test(existing) || /\n\s+"/.test(existing) ? 2 : /\n/.test(existing.trim()) ? 2 : 0;
-    return JSON.stringify(arr, null, indent || undefined) + '\n';
-  }
-  // csv
-  const eol = /\r\n/.test(existing) ? '\r\n' : '\n';
-  const style = csvBoolStyle(table?.csvBody);
-  const lstyle = csvListStyle(table?.csvBody);
-  const lines = rows.map(r => keys.map(k => csvCell(csvValue(r[k], table?.sample?.[k] as string | undefined, style, lstyle))).join(','));
-  if (!table) return [keys.map(csvCell).join(','), ...lines].join(eol) + eol;
-  const text = existing.endsWith('\n') || existing.endsWith('\r') ? existing : existing + eol;
-  return text + lines.join(eol) + eol;
-}
-
-// ─────────────────────────────────────────────────────────────
-// Hugging Face : lecture de la version courante, commit rattaché à cette version
-// ─────────────────────────────────────────────────────────────
-const enc = (p: string) => p.split('/').map(encodeURIComponent).join('/');
-
-async function headSha(cfg: HfConfig, repo: string): Promise<string | null> {
-  const res = await hf(cfg, `${cfg.endpoint}/api/datasets/${repo}`);
-  explain(res.status, repo);
-  if (!res.ok) throw new Error(`HF ${res.status} en lisant le dataset`);
-  const meta: any = await res.json();
-  return typeof meta?.sha === 'string' ? meta.sha : null;
-}
-
-async function listFiles(cfg: HfConfig, repo: string, rev: string): Promise<string[]> {
-  const res = await hf(cfg, `${cfg.endpoint}/api/datasets/${repo}/tree/${encodeURIComponent(rev)}?recursive=true`);
-  if (!res.ok) throw new Error(`HF ${res.status} en listant les fichiers du dataset`);
-  const items: any[] = await res.json();
-  return items.filter(i => i?.type === 'file' && typeof i.path === 'string').map(i => i.path);
-}
-
-async function readFile(cfg: HfConfig, repo: string, rev: string, filePath: string): Promise<string> {
-  const res = await hf(cfg, `${cfg.endpoint}/datasets/${repo}/resolve/${encodeURIComponent(rev)}/${enc(filePath)}`);
-  if (res.status === 404) return '';
-  if (!res.ok) throw new Error(`HF ${res.status} en lisant ${filePath}`);
-  return res.text();
-}
-
-function explain(status: number, repo: string) {
-  if (status === 401) throw Object.assign(new Error('HF 401 : jeton invalide ou expiré'), { fatal: true });
-  if (status === 403) throw Object.assign(new Error(`HF 403 : le jeton n'a pas le droit d'ÉCRIRE dans ${repo}`), { fatal: true });
-  if (status === 404) throw Object.assign(new Error(`HF 404 : dataset « ${repo} » introuvable, ou invisible avec ce jeton`), { fatal: true });
-}
-
-/** Corps NDJSON de l'API de commit : un en-tête puis un fichier par ligne. */
-export function buildCommitBody(summary: string, files: { path: string; content: string }[], parentCommit?: string | null): string {
-  const header: any = { summary };
-  if (parentCommit) header.parentCommit = parentCommit;
-  const lines: any[] = [{ key: 'header', value: header }];
-  for (const f of files) {
-    lines.push({ key: 'file', value: { path: f.path, content: Buffer.from(f.content, 'utf8').toString('base64'), encoding: 'base64' } });
-  }
-  return lines.map(l => JSON.stringify(l)).join('\n');
-}
-
-// ─────────────────────────────────────────────────────────────
-// File d'attente : les envois simultanés sont regroupés en un seul commit
-// ─────────────────────────────────────────────────────────────
-export interface SaveResult {
-  backend: 'huggingface' | 'local-file';
-  where: string;
-  note?: string;
-}
-interface Pending {
-  kind: Kind;
-  record: Record<string, any>;
-  resolveDone?: boolean;
-  resolve: (r: SaveResult) => void;
-  reject: (e: Error) => void;
-}
-const pending: Pending[] = [];
-let flushing = false;
-
-function writeLocal(kind: Kind, record: object): string {
-  const dir = path.resolve(process.cwd(), 'data');
-  fs.mkdirSync(dir, { recursive: true });
-  const file = path.join(dir, `${kind}.jsonl`);
-  fs.appendFileSync(file, pyJson(record) + '\n');
-  return file;
-}
-
-function fallbackLocal(p: Pending, why: string) {
-  const where = writeLocal(p.kind, p.record);
-  console.warn(`[Storage] ${p.kind} NON écrit sur Hugging Face (${why}) → gardé localement dans ${where} (éphémère sur Render).`);
-  p.resolve({ backend: 'local-file', where, note: why });
-}
-
-async function commitBatch(cfg: HfConfig, batch: Pending[]) {
-  const repo = await resolveRepo(cfg);
-  const allowCreate = process.env.HF_ALLOW_CREATE === '1';
-  let lastErr: Error = new Error('échec inconnu');
-
-  for (let attempt = 0; attempt < 6; attempt++) {
-    const sha = await headSha(cfg, repo);
-    const rev = sha || 'main';
-    const targets = pickTargets(await listFiles(cfg, repo, rev), fileOverrides(), allowCreate);
-
-    const files: { path: string; content: string }[] = [];
-    const committed: Pending[] = [];
-    for (const kind of ['feedback', 'reports'] as Kind[]) {
-      const group = batch.filter(p => p.kind === kind && !p.resolveDone);
-      if (!group.length) continue;
-      const target = targets[kind];
-      if (!target.path) {
-        // aucun fichier sûr : on ne crée RIEN, on garde le retour localement
-        group.forEach(p => { p.resolveDone = true; fallbackLocal(p, target.problem || 'fichier cible introuvable'); });
-        continue;
-      }
-      const fmt = fmtOf(target.path)!;
-      const existing = target.create ? '' : await readFile(cfg, repo, rev, target.path);
-      files.push({ path: target.path, content: appendRecords(fmt, existing, group.map(p => p.record)) });
-      committed.push(...group);
-    }
-    if (!files.length) return;
-
-    const res = await hf(cfg, `${cfg.endpoint}/api/datasets/${repo}/commit/main`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-ndjson' },
-      body: buildCommitBody(`${committed.length} retour(s) visiteur`, files, sha),
-    });
-    if (res.ok) {
-      for (const p of committed) {
-        p.resolveDone = true;
-        p.resolve({ backend: 'huggingface', where: `${repo}:${files.map(f => f.path).join(', ')}` });
-      }
-      return;
-    }
-    const text = (await res.text()).slice(0, 300);
-    explain(res.status, repo);
-    // 412 / 409 : le dataset a changé depuis la lecture → on relit et on recommence
-    lastErr = new Error(`HF ${res.status}: ${text}`);
-    await new Promise(r => setTimeout(r, 250 * (attempt + 1) + Math.random() * 250));
-  }
-  throw lastErr;
-}
-
-async function flush(cfg: HfConfig) {
-  if (flushing) return;
-  flushing = true;
-  try {
-    while (pending.length) {
-      const batch = pending.splice(0, pending.length);
-      try {
-        await commitBatch(cfg, batch);
-      } catch (err: any) {
-        batch.filter(p => !p.resolveDone).forEach(p => p.reject(err instanceof Error ? err : new Error(String(err))));
-      }
-    }
-  } finally {
-    flushing = false;
-  }
-}
-
-/** Enregistre un retour. Lève une erreur si Hugging Face est configuré mais que l'écriture échoue. */
-export async function saveRecord(kind: Kind, data: object): Promise<SaveResult> {
-  const record = buildRecord(kind, data as Record<string, any>);
-  const cfg = readHfConfig();
-  if (!cfg) {
-    const where = writeLocal(kind, record);
-    console.warn(
-      `[Storage] Hugging Face NON configuré (HF_TOKEN + HF_DATASET attendus) : ${kind} écrit dans ${where}, ` +
-        `fichier éphémère sur Render. Voir GET /api/storage-status.`
-    );
-    return { backend: 'local-file', where };
-  }
-  return new Promise<SaveResult>((resolve, reject) => {
-    pending.push({ kind, record, resolve, reject });
-    void flush(cfg);
-  });
-}
-
-// ─────────────────────────────────────────────────────────────
-// Diagnostic (jamais de contenu des retours, jamais le jeton)
-// ─────────────────────────────────────────────────────────────
-async function describeTarget(cfg: HfConfig, repo: string, rev: string, t: Target) {
-  if (!t.path) return { file: null, problem: t.problem, candidates: t.candidates };
-  const fmt = fmtOf(t.path)!;
-  try {
-    const table = inspectTable(fmt, t.create ? '' : await readFile(cfg, repo, rev, t.path));
-    return { file: t.path, format: fmt, rows: table?.rows ?? 0, columns: table?.keys ?? [], will_create: !!t.create || undefined };
-  } catch (e: any) {
-    return { file: t.path, format: fmt, problem: String(e?.message || e) };
-  }
-}
-
-export async function checkStorage() {
-  const info: any = describeConfig();
-  const cfg = readHfConfig();
-  if (!cfg) return { ...info, ok: false, problem: 'HF_TOKEN et/ou le dataset ne sont pas détectés par le serveur.' };
-  try {
-    const repo = await resolveRepo(cfg);
-    info.dataset = repo;
-    const sha = await headSha(cfg, repo);
-    const rev = sha || 'main';
-    const targets = pickTargets(await listFiles(cfg, repo, rev), fileOverrides(), process.env.HF_ALLOW_CREATE === '1');
-    const who = await hf(cfg, `${cfg.endpoint}/api/whoami-v2`);
-    const me: any = who.ok ? await who.json() : null;
-    const role = me?.auth?.accessToken?.role;
-    return {
-      ...info,
-      ok: !!targets.feedback.path && !!targets.reports.path,
-      token_role: role ?? 'inconnu',
-      warning: role === 'read' ? "Le jeton est en LECTURE seule : l'écriture échouera (créez un jeton « Write »)." : undefined,
-      feedback: await describeTarget(cfg, repo, rev, targets.feedback),
-      reports: await describeTarget(cfg, repo, rev, targets.reports),
-    };
-  } catch (e: any) {
-    return { ...info, ok: false, problem: String(e?.message || e) };
-  }
-}
-
-/** Au démarrage : affiche dans les logs les fichiers du dataset et ceux qui seront complétés. */
-export async function logDatasetFiles() {
-  const cfg = readHfConfig();
-  if (!cfg) return;
-  try {
-    const repo = await resolveRepo(cfg);
-    const rev = (await headSha(cfg, repo)) || 'main';
-    const files = await listFiles(cfg, repo, rev);
-    const targets = pickTargets(files, fileOverrides(), process.env.HF_ALLOW_CREATE === '1');
-    console.log(`[Storage] Fichiers du dataset « ${repo} » (${files.length}) : ${files.slice(0, 40).join(', ')}${files.length > 40 ? ', …' : ''}`);
-    for (const k of ['feedback', 'reports'] as Kind[]) {
-      const t = targets[k];
-      console.log(t.path ? `[Storage] ${k} → les lignes seront AJOUTÉES à « ${t.path} »` : `[Storage] ${k} → AUCUN fichier retenu : ${t.problem}`);
-    }
-  } catch (e: any) {
-    console.warn('[Storage] lecture du dataset impossible au démarrage :', e?.message || e);
-  }
-}
+// ── corps du commit ──
+const lines = buildCommitBody('résumé', [{ path: 'feedback.jsonl', content: '{"a":"é"}\n' }], 'sha123').split('\n').map(l => JSON.parse(l));
+assert.equal(lines[0].value.parentCommit, 'sha123'); assert.equal(lines[1].value.path, 'feedback.jsonl');
+assert.equal(Buffer.from(lines[1].value.content, 'base64').toString('utf8'), '{"a":"é"}\n');
+assert.ok(!('parentCommit' in JSON.parse(buildCommitBody('x', [])) .value));
+console.log('storage : OK');
