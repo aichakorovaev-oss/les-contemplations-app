@@ -19,7 +19,7 @@ import {
 import { synthesize, MAX_TTS_CHARS } from './server/tts.ts';
 import { DEFAULT_TEXT_MODELS, parseModels, withFallback } from './server/fallback.ts';
 import { languageMismatch, languageSystemInstruction } from './src/shared/lang.ts';
-import { checkStorage, describeConfig, sanitizeFeedback, sanitizeReport, saveRecord } from './server/storage.ts';
+import { checkStorage, describeConfig, logDatasetFiles, sanitizeFeedback, sanitizeReport, saveRecord } from './server/storage.ts';
 
 dotenv.config();
 
@@ -289,6 +289,8 @@ console.log(
     ? `Retours visiteurs → Hugging Face dataset « ${storageStatus.dataset} » (jeton : ${storageStatus.token_variable}, dataset : ${storageStatus.dataset_variable})`
     : `Retours visiteurs → fichier LOCAL éphémère : HF_TOKEN et/ou dataset non détectés (jetons vus : ${storageStatus.token_variables_found.join(', ') || 'aucun'} ; datasets vus : ${storageStatus.dataset_variables_found.join(', ') || 'aucun'})`
 );
+
+void logDatasetFiles(); // fichiers du dataset et fichiers qui seront complétés (affichés dans les logs)
 
 function recordHandler(kind: 'feedback' | 'reports', clean: (b: any) => object | null, label: string) {
   return async (req: express.Request, res: express.Response) => {
