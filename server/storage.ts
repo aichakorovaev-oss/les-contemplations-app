@@ -17,7 +17,7 @@
  */
 import fs from 'fs';
 import path from 'path';
-import { randomBytes } from 'crypto';
+import { randomUUID } from 'crypto';
 
 export type Kind = 'feedback' | 'reports';
 
@@ -160,6 +160,55 @@ export async function resolveRepo(cfg: HfConfig): Promise<string> {
   return `${me.name}/${cfg.repo}`;
 }
 
+
+// ─────────────────────────────────────────────────────────────
+// Format EXACT des enregistrements de l'ancienne version (relevé sur les fichiers du dataset)
+//
+//   feedback (type « app_feedback ») :
+//     id, ts, date, type, rating, empty_frame_seen, resonated, surprised, would_recommend,
+//     why_not, comment, mood_tags, painting_count, lang, nonce
+//   report (type « report ») :
+//     id, ts, date, type, painting_id, painting_title, reason_category, reason_text,
+//     mood_tags, lang, nonce
+//
+//   id    : UUID v4                          ts : secondes Unix en nombre à virgule (1790834519.93)
+//   date  : ISO UTC à la seconde « +00:00 » (2026-10-01T06:01:59+00:00)
+//   JSON  : séparateurs Python « , » et « : », accents non échappés, une ligne par enregistrement
+// ─────────────────────────────────────────────────────────────
+/** Nombre à virgule : s'écrit toujours avec une décimale (1791585043.0), comme le float de Python. */
+export class PyFloat {
+  constructor(public value: number) {}
+  toJSON() { return this.value; }
+  toString() { return Number.isInteger(this.value) ? this.value.toFixed(1) : String(this.value); }
+}
+
+/** json.dumps(obj, ensure_ascii=False) de Python : « {"a": 1, "b": [1, 2]} ». */
+export function pyJson(v: any): string {
+  if (v instanceof PyFloat) return v.toString();
+  if (v === null || v === undefined) return 'null';
+  if (Array.isArray(v)) return '[' + v.map(pyJson).join(', ') + ']';
+  if (typeof v === 'object') return '{' + Object.entries(v).filter(([, x]) => x !== undefined).map(([k, x]) => `${JSON.stringify(k)}: ${pyJson(x)}`).join(', ') + '}';
+  return JSON.stringify(v);
+}
+
+/** « 2026-10-01T06:01:59+00:00 » (datetime.isoformat(timespec="seconds") en UTC). */
+export function isoSeconds(d: Date): string {
+  return d.toISOString().slice(0, 19) + '+00:00';
+}
+
+const TYPE_OF: Record<Kind, string> = { feedback: 'app_feedback', reports: 'report' };
+
+/** Enregistrement complet, clés dans l'ordre de l'ancienne version. `data` vient de sanitizeFeedback/Report. */
+export function buildRecord(kind: Kind, data: Record<string, any>, now = new Date()): Record<string, any> {
+  const head = { id: randomUUID(), ts: new PyFloat(now.getTime() / 1000), date: isoSeconds(now), type: TYPE_OF[kind] };
+  if (kind === 'feedback') {
+    return { ...head, rating: data.rating ?? null, empty_frame_seen: data.empty_frame_seen ?? null, resonated: data.resonated ?? null,
+      surprised: data.surprised ?? null, would_recommend: data.would_recommend ?? null, why_not: data.why_not ?? '', comment: data.comment ?? '',
+      mood_tags: data.mood_tags ?? [], painting_count: data.painting_count ?? null, lang: data.lang ?? 'fr', nonce: data.nonce ?? '' };
+  }
+  return { ...head, painting_id: data.painting_id ?? null, painting_title: data.painting_title ?? null, reason_category: data.reason_category ?? '',
+    reason_text: data.reason_text ?? '', mood_tags: data.mood_tags ?? [], lang: data.lang ?? 'fr', nonce: data.nonce ?? '' };
+}
 
 // ─────────────────────────────────────────────────────────────
 // Fichiers cibles : jamais de création, on retrouve les fichiers existants
@@ -358,8 +407,17 @@ export function appendRecords(fmt: Fmt, existing: string, records: Record<string
   const keys = table ? table.keys : Object.keys(records[0] || {});
 
   if (fmt === 'jsonl') {
+    // Les lignes suivent le format de l'ancienne version (voir buildRecord) : on ne copie PAS le style de la
+    // dernière ligne du fichier (qui pourrait elle-même être mal formée). Une colonne présente dans le
+    // fichier mais inconnue ici est ajoutée en fin de ligne avec la valeur null.
+    const extra = table ? table.keys : [];
+    const lines = records.map(r => {
+      const row: Record<string, any> = { ...r };
+      for (const k of extra) if (!(k in row)) row[k] = null;
+      return pyJson(row);
+    });
     const text = existing.endsWith('\n') || !existing ? existing : existing + '\n';
-    return text + rows.map(r => JSON.stringify(r)).join('\n') + '\n';
+    return text + lines.join('\n') + '\n';
   }
   if (fmt === 'json') {
     const arr: any[] = table ? JSON.parse(existing.replace(/^\uFEFF/, '')) : [];
@@ -443,7 +501,7 @@ function writeLocal(kind: Kind, record: object): string {
   const dir = path.resolve(process.cwd(), 'data');
   fs.mkdirSync(dir, { recursive: true });
   const file = path.join(dir, `${kind}.jsonl`);
-  fs.appendFileSync(file, JSON.stringify(record) + '\n');
+  fs.appendFileSync(file, pyJson(record) + '\n');
   return file;
 }
 
@@ -521,7 +579,7 @@ async function flush(cfg: HfConfig) {
 
 /** Enregistre un retour. Lève une erreur si Hugging Face est configuré mais que l'écriture échoue. */
 export async function saveRecord(kind: Kind, data: object): Promise<SaveResult> {
-  const record = { id: randomBytes(8).toString('hex'), kind, created_at: new Date().toISOString(), ...data };
+  const record = buildRecord(kind, data as Record<string, any>);
   const cfg = readHfConfig();
   if (!cfg) {
     const where = writeLocal(kind, record);
